@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { Store } from "@tauri-apps/plugin-store";
 import { motion } from "framer-motion";
 import "./App.css";
 
@@ -27,6 +28,24 @@ type PullProgress = {
   total_bytes: number;
 };
 
+type Settings = {
+  downloadDir: string;
+  maxConcurrent: number;
+  maxMbps: number;
+  discoveryIntervalMs: number;
+  sameSubnetOnly: boolean;
+};
+
+const DEFAULT_SETTINGS: Settings = {
+  downloadDir: "",
+  maxConcurrent: 2,
+  maxMbps: 0,
+  discoveryIntervalMs: 5000,
+  sameSubnetOnly: false,
+};
+
+const SETTINGS_STORE_PATH = "settings.json";
+
 function App() {
   const [devices, setDevices] = useState<DeviceInfo[]>([]);
   const [activeDevice, setActiveDevice] = useState<DeviceInfo | null>(null);
@@ -39,6 +58,9 @@ function App() {
   const [statusType, setStatusType] = useState<"success" | "error" | "info">("info");
   const [pullingId, setPullingId] = useState<string | null>(null);
   const [pullProgress, setPullProgress] = useState<PullProgress | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
+  const [settingsLoading, setSettingsLoading] = useState(true);
   const emptyState = useMemo(() => devices.length === 0, [devices.length]);
 
   useEffect(() => {
@@ -69,6 +91,32 @@ function App() {
 
   useEffect(() => {
     invoke<SharedEntry[]>("list_shared_command").then((list) => setSharedList(list ?? []));
+  }, []);
+
+  useEffect(() => {
+    let store: Store | null = null;
+    let cancelled = false;
+    const loadSettings = async () => {
+      try {
+        store = await Store.load(SETTINGS_STORE_PATH);
+        const saved = await store.get<Settings>("settings");
+        if (!cancelled && saved) {
+          const merged = { ...DEFAULT_SETTINGS, ...saved };
+          setSettings(merged);
+          setDownloadDir(merged.downloadDir || "");
+        }
+      } catch (error) {
+        console.error("Failed to load settings", error);
+      } finally {
+        if (!cancelled) {
+          setSettingsLoading(false);
+        }
+      }
+    };
+    loadSettings();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -108,8 +156,37 @@ function App() {
       multiple: false,
     });
     if (typeof folder === "string") {
+      setSettings((prev) => ({ ...prev, downloadDir: folder }));
       setDownloadDir(folder);
     }
+  };
+
+  const saveSettings = async (next: Settings) => {
+    const store = await Store.load(SETTINGS_STORE_PATH);
+    await store.set("settings", next);
+    await store.save();
+    setSettings(next);
+    setDownloadDir(next.downloadDir || "");
+    await invoke("update_settings_command", {
+      maxConcurrent: next.maxConcurrent,
+      maxMbps: next.maxMbps,
+      discoveryIntervalMs: next.discoveryIntervalMs,
+      sameSubnetOnly: next.sameSubnetOnly,
+    });
+  };
+
+  const resetSettings = async () => {
+    const store = await Store.load(SETTINGS_STORE_PATH);
+    await store.clear();
+    await store.save();
+    setSettings(DEFAULT_SETTINGS);
+    setDownloadDir("");
+    await invoke("update_settings_command", {
+      maxConcurrent: DEFAULT_SETTINGS.maxConcurrent,
+      maxMbps: DEFAULT_SETTINGS.maxMbps,
+      discoveryIntervalMs: DEFAULT_SETTINGS.discoveryIntervalMs,
+      sameSubnetOnly: DEFAULT_SETTINGS.sameSubnetOnly,
+    });
   };
 
   const pullEntry = async (entry: SharedEntry) => {
@@ -170,7 +247,14 @@ function App() {
             <p className="text-sm text-white/60">拖拽文件到窗口，极速发送</p>
           </div>
           <div className="flex items-center gap-2">
-            <button className="subtle-button" data-tauri-drag-region="false">设置</button>
+            <button
+              className="subtle-button"
+              data-tauri-drag-region="false"
+              onClick={() => setSettingsOpen(true)}
+              type="button"
+            >
+              设置
+            </button>
             <button className="glow-button" data-tauri-drag-region="false">新建传输</button>
             <button
               className="close-button"
@@ -370,6 +454,137 @@ function App() {
           <div className="glass-card px-8 py-6 text-center">
             <p className="text-lg font-semibold text-white">松开即可发送</p>
             <p className="text-xs text-white/50">将文件传输到选中的设备</p>
+          </div>
+        </div>
+      )}
+
+      {settingsOpen && (
+        <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/50 backdrop-blur-sm">
+          <div className="glass-panel w-full max-w-xl p-6">
+            <div className="flex items-center justify-between">
+              <h2 className="text-lg font-semibold text-white">设置</h2>
+              <button
+                className="close-button"
+                onClick={() => setSettingsOpen(false)}
+                type="button"
+              >
+                ×
+              </button>
+            </div>
+
+            {settingsLoading ? (
+              <p className="mt-6 text-sm text-white/60">加载中...</p>
+            ) : (
+              <form
+                className="mt-6 space-y-4"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void saveSettings(settings);
+                  setSettingsOpen(false);
+                }}
+              >
+                <div className="glass-card p-4">
+                  <label className="text-xs text-white/60">下载目录</label>
+                  <div className="mt-2 flex items-center gap-2">
+                    <button className="subtle-button" type="button" onClick={chooseDownloadDir}>
+                      选择目录
+                    </button>
+                    <span className="truncate text-xs text-white/60">
+                      {settings.downloadDir || downloadDir || "未选择"}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="glass-card p-4">
+                  <label className="text-xs text-white/60">传输并发</label>
+                  <input
+                    className="mt-2 w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-white"
+                    type="number"
+                    min={1}
+                    max={8}
+                    value={settings.maxConcurrent}
+                    onChange={(event) =>
+                      setSettings((prev) => ({
+                        ...prev,
+                        maxConcurrent: Math.max(1, Number(event.target.value || 1)),
+                      }))
+                    }
+                  />
+                </div>
+
+                <div className="glass-card p-4">
+                  <label className="text-xs text-white/60">限速 (Mbps，0 表示不限速)</label>
+                  <input
+                    className="mt-2 w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-white"
+                    type="number"
+                    min={0}
+                    value={settings.maxMbps}
+                    onChange={(event) =>
+                      setSettings((prev) => ({
+                        ...prev,
+                        maxMbps: Math.max(0, Number(event.target.value || 0)),
+                      }))
+                    }
+                  />
+                </div>
+
+                <div className="glass-card p-4">
+                  <label className="text-xs text-white/60">自动发现刷新 (毫秒)</label>
+                  <input
+                    className="mt-2 w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-white"
+                    type="number"
+                    min={1000}
+                    step={500}
+                    value={settings.discoveryIntervalMs}
+                    onChange={(event) =>
+                      setSettings((prev) => ({
+                        ...prev,
+                        discoveryIntervalMs: Math.max(1000, Number(event.target.value || 1000)),
+                      }))
+                    }
+                  />
+                </div>
+
+                <div className="glass-card flex items-center justify-between p-4">
+                  <div>
+                    <p className="text-sm text-white">仅显示同网段设备</p>
+                    <p className="text-xs text-white/50">过滤非本机网段的设备</p>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={settings.sameSubnetOnly}
+                    onChange={(event) =>
+                      setSettings((prev) => ({
+                        ...prev,
+                        sameSubnetOnly: event.target.checked,
+                      }))
+                    }
+                  />
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <button
+                    className="subtle-button"
+                    type="button"
+                    onClick={() => void resetSettings()}
+                  >
+                    恢复默认
+                  </button>
+                  <div className="flex items-center gap-2">
+                    <button
+                      className="subtle-button"
+                      type="button"
+                      onClick={() => setSettingsOpen(false)}
+                    >
+                      取消
+                    </button>
+                    <button className="glow-button" type="submit">
+                      保存
+                    </button>
+                  </div>
+                </div>
+              </form>
+            )}
           </div>
         </div>
       )}

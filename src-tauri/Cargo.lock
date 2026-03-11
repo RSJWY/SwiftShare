@@ -1823,6 +1823,16 @@ dependencies = [
 
 [[package]]
 name = "if-addrs"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cabb0019d51a643781ff15c9c8a3e5dedc365c47211270f4e8f82812fedd8f0a"
+dependencies = [
+ "libc",
+ "windows-sys 0.48.0",
+]
+
+[[package]]
+name = "if-addrs"
 version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69b2eeee38fef3aa9b4cc5f1beea8a2444fc00e7377cafae396de3f5c2065e24"
@@ -2152,7 +2162,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fe7c11a1eb3cfbfcf702d1601c1f5f4c102cdc8665b8a557783ef634741676e"
 dependencies = [
  "flume",
- "if-addrs",
+ "if-addrs 0.13.4",
  "log",
  "polling 2.8.0",
  "socket2 0.5.10",
@@ -3884,6 +3894,7 @@ name = "tauri-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "if-addrs 0.10.2",
  "local-ip-address",
  "mdns-sd",
  "serde",
@@ -3892,6 +3903,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
+ "tauri-plugin-store",
  "tokio",
 ]
 
@@ -4035,6 +4047,22 @@ dependencies = [
  "url",
  "windows",
  "zbus",
+]
+
+[[package]]
+name = "tauri-plugin-store"
+version = "2.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ca1a8ff83c269b115e98726ffc13f9e548a10161544a92ad121d6d0a96e16ea"
+dependencies = [
+ "dunce",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-plugin",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

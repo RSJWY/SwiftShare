@@ -85,6 +85,7 @@ pub async fn start_transfer(
     paths: Vec<String>,
     target_ip: String,
     target_port: u16,
+    max_mbps: u64,
 ) -> Result<()> {
     let mut queue = VecDeque::new();
     for input in paths {
@@ -123,9 +124,9 @@ pub async fn start_transfer(
         };
 
         let send_result = if entry.size <= SMALL_FILE_LIMIT {
-            send_small_file_stream(&mut stream, &entry, offset, &mut status).await
+            send_small_file_stream(&mut stream, &entry, offset, &mut status, max_mbps).await
         } else {
-            send_file_chunked(&mut stream, &entry, offset, &mut status).await
+            send_file_chunked(&mut stream, &entry, offset, &mut status, max_mbps).await
         };
 
         if send_result.is_err() {
@@ -135,9 +136,9 @@ pub async fn start_transfer(
                 .await?;
             let offset = request_resume_offset(&mut stream, &entry).await.unwrap_or(0);
             if entry.size <= SMALL_FILE_LIMIT {
-                send_small_file_stream(&mut stream, &entry, offset, &mut status).await?;
+                send_small_file_stream(&mut stream, &entry, offset, &mut status, max_mbps).await?;
             } else {
-                send_file_chunked(&mut stream, &entry, offset, &mut status).await?;
+                send_file_chunked(&mut stream, &entry, offset, &mut status, max_mbps).await?;
             }
         }
 
@@ -215,7 +216,7 @@ async fn handle_connection(peer_key: String, pool: ConnectionPool, shared: Share
             let mut payload = vec![0u8; len as usize];
             stream.read_exact(&mut payload).await?;
             let (path, size, offset) = parse_meta(&payload)?;
-            receive_streamed_file(&mut stream, PathBuf::from(path), size, offset, |_| {}).await?;
+            receive_streamed_file(&mut stream, PathBuf::from(path), size, offset, 0, |_| {}).await?;
         } else if packet_type == PacketType::FileChunk as u16 {
             let mut payload = vec![0u8; len as usize];
             stream.read_exact(&mut payload).await?;
@@ -357,6 +358,7 @@ pub async fn pull_file(
     target_ip: String,
     target_port: u16,
     dest_dir: String,
+    max_mbps: u64,
     mut on_progress: impl FnMut(PullProgress) + Send,
 ) -> Result<()> {
     let addr = format!("{}:{}", target_ip, target_port);
@@ -383,7 +385,7 @@ pub async fn pull_file(
         let mut target_path = PathBuf::from(&dest_dir);
         target_path.push(name.clone());
 
-        let result = receive_streamed_file(&mut stream, target_path, size, offset, |received| {
+        let result = receive_streamed_file(&mut stream, target_path, size, offset, max_mbps, |received| {
             on_progress(PullProgress {
                 entry_id: entry_id.clone(),
                 name: name.clone(),
@@ -516,6 +518,7 @@ async fn receive_streamed_file(
     path: PathBuf,
     size: u64,
     offset: u64,
+    max_mbps: u64,
     mut on_progress: impl FnMut(u64),
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -538,6 +541,7 @@ async fn receive_streamed_file(
     let mut remaining = size.saturating_sub(offset);
     let mut received = offset;
     let mut buf = vec![0u8; 64 * 1024];
+    let throttle = Throttle::new(max_mbps);
     while remaining > 0 {
         let read_len = buf.len().min(remaining as usize);
         let read = stream.read(&mut buf[..read_len]).await?;
@@ -548,6 +552,7 @@ async fn receive_streamed_file(
         received += read as u64;
         on_progress(received);
         remaining -= read as u64;
+        throttle.throttle(read as u64).await;
     }
     Ok(())
 }
@@ -664,6 +669,7 @@ async fn send_small_file_stream(
     entry: &FileEntry,
     offset: u64,
     status: &mut TransferStatus,
+    max_mbps: u64,
 ) -> Result<()> {
     let mut file = File::open(&entry.path).await?;
     if offset > 0 {
@@ -679,6 +685,7 @@ async fn send_small_file_stream(
     write_packet(stream, PacketType::SmallFileStream, 0, &meta_payload).await?;
 
     let mut buf = vec![0u8; 64 * 1024];
+    let throttle = Throttle::new(max_mbps);
     loop {
         let read = file.read(&mut buf).await?;
         if read == 0 {
@@ -686,6 +693,7 @@ async fn send_small_file_stream(
         }
         stream.write_all(&buf[..read]).await?;
         status.bytes_sent += read as u64;
+        throttle.throttle(read as u64).await;
     }
     Ok(())
 }
@@ -695,6 +703,7 @@ async fn send_file_chunked(
     entry: &FileEntry,
     offset: u64,
     status: &mut TransferStatus,
+    max_mbps: u64,
 ) -> Result<()> {
     let mut file = File::open(&entry.path).await?;
     if offset > 0 {
@@ -710,6 +719,7 @@ async fn send_file_chunked(
     write_packet(stream, PacketType::FileMeta, 0, &meta_payload).await?;
 
     let mut buf = vec![0u8; 128 * 1024];
+    let throttle = Throttle::new(max_mbps);
     let mut current_offset = offset;
     loop {
         let read = file.read(&mut buf).await?;
@@ -719,8 +729,39 @@ async fn send_file_chunked(
         write_packet(stream, PacketType::FileChunk, current_offset, &buf[..read]).await?;
         current_offset += read as u64;
         status.bytes_sent += read as u64;
+        throttle.throttle(read as u64).await;
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct Throttle {
+    bytes_per_sec: u64,
+}
+
+impl Throttle {
+    fn new(max_mbps: u64) -> Self {
+        let bytes_per_sec = if max_mbps == 0 {
+            0
+        } else {
+            max_mbps.saturating_mul(1024 * 1024) / 8
+        };
+        Self { bytes_per_sec }
+    }
+
+    async fn throttle(&self, bytes: u64) {
+        if self.bytes_per_sec == 0 {
+            return;
+        }
+        let secs = bytes as f64 / self.bytes_per_sec as f64;
+        if secs <= 0.0 {
+            return;
+        }
+        let ms = (secs * 1000.0).ceil() as u64;
+        if ms > 0 {
+            sleep(Duration::from_millis(ms)).await;
+        }
+    }
 }
 
 async fn write_packet(

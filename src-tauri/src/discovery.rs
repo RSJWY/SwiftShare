@@ -1,4 +1,5 @@
 use anyhow::Result;
+use if_addrs;
 use local_ip_address::{list_afinet_netifas, local_ip};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::Serialize;
@@ -26,7 +27,11 @@ struct NetInterface {
     ip: IpAddr,
 }
 
-pub fn start(app: AppHandle, port: u16) -> Result<DiscoveryHandle> {
+pub fn start(
+    app: AppHandle,
+    port: u16,
+    settings: std::sync::Arc<crate::SettingsState>,
+) -> Result<DiscoveryHandle> {
     let daemon = ServiceDaemon::new()?;
     let hostname = get_hostname();
     let host_label = ensure_local_domain(&hostname);
@@ -64,6 +69,7 @@ pub fn start(app: AppHandle, port: u16) -> Result<DiscoveryHandle> {
 
     thread::spawn(move || {
         let mut services: HashMap<String, DeviceInfo> = HashMap::new();
+        let mut last_emit = std::time::Instant::now();
 
         while let Ok(event) = receiver.recv() {
             match event {
@@ -80,12 +86,18 @@ pub fn start(app: AppHandle, port: u16) -> Result<DiscoveryHandle> {
                             port,
                         };
                         services.insert(fullname, device);
-                        emit_devices(&app, &services);
+                        if should_emit(&settings, &last_emit) {
+                            emit_devices(&app, &services, &settings);
+                            last_emit = std::time::Instant::now();
+                        }
                     }
                 }
                 ServiceEvent::ServiceRemoved(_ty, fullname) => {
                     services.remove(&fullname);
-                    emit_devices(&app, &services);
+                    if should_emit(&settings, &last_emit) {
+                        emit_devices(&app, &services, &settings);
+                        last_emit = std::time::Instant::now();
+                    }
                 }
                 _ => {}
             }
@@ -129,9 +141,21 @@ fn list_interfaces() -> Result<Vec<NetInterface>> {
     Ok(result)
 }
 
-fn emit_devices(app: &AppHandle, services: &HashMap<String, DeviceInfo>) {
+fn emit_devices(
+    app: &AppHandle,
+    services: &HashMap<String, DeviceInfo>,
+    settings: &std::sync::Arc<crate::SettingsState>,
+) {
     let mut aggregated: HashMap<String, DeviceInfo> = HashMap::new();
+    let same_subnet_only = settings
+        .same_subnet_only
+        .load(std::sync::atomic::Ordering::Relaxed)
+        == 1;
+    let local_ipv4 = local_ipv4_networks();
     for device in services.values() {
+        if same_subnet_only && !same_subnet_ipv4(&local_ipv4, &device.ip) {
+            continue;
+        }
         let key = base_name_from_fullname(&device.name);
         if let Some(existing) = aggregated.get_mut(&key) {
             if should_replace_device(existing, device) {
@@ -145,6 +169,53 @@ fn emit_devices(app: &AppHandle, services: &HashMap<String, DeviceInfo>) {
         "device-list-updated",
         aggregated.values().cloned().collect::<Vec<_>>(),
     );
+}
+
+fn should_emit(
+    settings: &std::sync::Arc<crate::SettingsState>,
+    last_emit: &std::time::Instant,
+) -> bool {
+    let interval = settings
+        .discovery_interval_ms
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if interval == 0 {
+        return true;
+    }
+    last_emit.elapsed().as_millis() >= interval as u128
+}
+
+fn local_ipv4_networks() -> Vec<(std::net::Ipv4Addr, std::net::Ipv4Addr)> {
+    let mut nets = Vec::new();
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for iface in ifaces {
+            if iface.is_loopback() || iface.is_link_local() {
+                continue;
+            }
+            match iface.addr {
+                if_addrs::IfAddr::V4(v4) => {
+                    nets.push((v4.ip, v4.netmask));
+                }
+                _ => {}
+            }
+        }
+    }
+    nets
+}
+
+fn same_subnet_ipv4(
+    local_nets: &[(std::net::Ipv4Addr, std::net::Ipv4Addr)],
+    target_ip: &str,
+) -> bool {
+    let target: std::net::Ipv4Addr = match target_ip.parse() {
+        Ok(ip) => ip,
+        Err(_) => return false,
+    };
+    for (ip, mask) in local_nets {
+        if (u32::from(*ip) & u32::from(*mask)) == (u32::from(target) & u32::from(*mask)) {
+            return true;
+        }
+    }
+    false
 }
 
 fn base_service_name(info: &ServiceInfo) -> String {
