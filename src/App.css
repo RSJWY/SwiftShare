@@ -1,0 +1,41 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    font-family: "Inter", "SF Pro Text", system-ui, -apple-system, sans-serif;
+    background: radial-gradient(120% 120% at 20% 10%, #1a2030 0%, #0b0e14 55%, #07090c 100%);
+    color: #eef2ff;
+  }
+}
+
+@layer components {
+  .glass-panel {
+    @apply rounded-3xl border border-white/10 bg-white/10 shadow-2xl backdrop-blur-2xl;
+  }
+
+  .glass-card {
+    @apply rounded-2xl border border-white/10 bg-white/5 backdrop-blur-xl;
+  }
+
+  .glow-button {
+    @apply rounded-full bg-indigo-500/90 px-4 py-2 text-sm font-medium text-white shadow-[0_10px_30px_rgba(79,70,229,0.35)] transition hover:bg-indigo-400;
+  }
+
+  .subtle-button {
+    @apply rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm text-white/80 transition hover:bg-white/10;
+  }
+
+  .close-button {
+    @apply flex h-9 w-9 items-center justify-center rounded-full border border-white/10 bg-white/5 text-lg text-white/70 transition hover:bg-white/10 hover:text-white;
+  }
+}
