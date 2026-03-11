@@ -15,6 +15,9 @@
         "title": "tauri-app",
         "width": 800,
         "height": 600,
+        "minWidth": 720,
+        "minHeight": 560,
+        "dragDropEnabled": false,
         "transparent": true,
         "decorations": false,
         "windowEffects": {

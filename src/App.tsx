@@ -240,8 +240,8 @@ function App() {
       </div>
 
       <div className="relative mx-auto flex h-full max-w-6xl flex-col gap-6 px-6 py-8">
-        <header className="flex items-center justify-between">
-          <div data-tauri-drag-region>
+        <header className="flex items-center justify-between" data-tauri-drag-region>
+          <div>
             <p className="text-xs uppercase tracking-[0.4em] text-indigo-200/70">SwiftShare</p>
             <h1 className="text-3xl font-semibold text-white">局域网极速传输</h1>
             <p className="text-sm text-white/60">拖拽文件到窗口，极速发送</p>
