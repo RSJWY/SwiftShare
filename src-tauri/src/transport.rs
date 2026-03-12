@@ -151,8 +151,9 @@ pub async fn start_transfer(
     Ok(())
 }
 
-pub async fn start_listener() -> Result<TransportHandle> {
-    let listener = TcpListener::bind(("0.0.0.0", 0)).await?;
+pub async fn start_listener(port: Option<u16>) -> Result<TransportHandle> {
+    let bind_port = port.unwrap_or(0);  // 0 表示随机端口
+    let listener = TcpListener::bind(("0.0.0.0", bind_port)).await?;
     let port = listener.local_addr()?.port();
     let pool = ConnectionPool::default();
     let outbound_pool = ConnectionPool::default();

@@ -215,7 +215,12 @@ pub fn run() {
                 });
             }
             tauri::async_runtime::spawn(async move {
-                if let Ok(transport) = start_listener().await {
+                // 读取环境变量，开发模式使用固定端口，生产模式使用随机端口
+                let port = std::env::var("TAURI_DEV_PORT")
+                    .ok()
+                    .and_then(|s| s.parse::<u16>().ok());
+
+                if let Ok(transport) = start_listener(port).await {
                     let transport = Arc::new(transport);
                     discovery::start(handle.clone(), transport.clone(), settings.clone()).ok();
                     let storage = TRANSPORT_HANDLE

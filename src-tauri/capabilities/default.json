@@ -9,6 +9,7 @@
     "store:default",
     "core:event:default",
     "opener:default",
-    "dialog:default"
+    "dialog:default",
+    "drag:default"
   ]
 }
