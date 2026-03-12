@@ -2,7 +2,6 @@ use anyhow::Result;
 use local_ip_address::{list_afinet_netifas, local_ip};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::Serialize;
-use serde_json;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::thread;
@@ -51,23 +50,25 @@ pub fn start(
     let interface_ips: Vec<IpAddr> = interfaces.iter().map(|iface| iface.ip).collect();
     let machine_id = transport.machine_id.clone();
 
-    eprintln!("[Discovery] Starting with hostname: {}, machine_id: {}, port: {}", hostname, machine_id, transport.port);
-    eprintln!("[Discovery] Local IPs: {:?}", interface_ips);
-
     let mut announced: Vec<AnnouncedService> = Vec::new();
 
     // Register our service
+    // Service name format: "shortid-port[hostname]"
+    // shortid = first 8 chars of UUID to stay under 63-byte DNS label limit
+    // Different ports get distinct service names for multi-instance support
+    let short_id = &machine_id[..machine_id.len().min(8)];
     if interfaces.is_empty() {
         let ip = local_ip()?;
-        let service_name = format!("{}[{}]", machine_id, hostname);
-        eprintln!("[Discovery] Registering service: {} on ip {}:{}", service_name, ip, transport.port);
+        let service_name = format!("{}-{}[{}]", short_id, transport.port, hostname);
+        let mut props = HashMap::new();
+        props.insert("mid".to_string(), machine_id.clone());
         let service = ServiceInfo::new(
             SERVICE_TYPE,
             &service_name,
             &host_label,
             ip,
             transport.port,
-            HashMap::new(),
+            props,
         )?;
         daemon.register(service.clone())?;
         announced.push(AnnouncedService {
@@ -79,18 +80,18 @@ pub fn start(
     } else {
         for iface in &interfaces {
             if is_virtual_interface(&iface.name) {
-                eprintln!("[Discovery] Skipping virtual interface: {}", iface.name);
                 continue;
             }
-            let service_name = format!("{}[{}]", machine_id, hostname);
-            eprintln!("[Discovery] Registering service: {} on {}:{}", service_name, iface.ip, transport.port);
+            let service_name = format!("{}-{}[{}]", short_id, transport.port, hostname);
+            let mut props = HashMap::new();
+            props.insert("mid".to_string(), machine_id.clone());
             let service = ServiceInfo::new(
                 SERVICE_TYPE,
                 &service_name,
                 &host_label,
                 iface.ip,
                 transport.port,
-                HashMap::new(),
+                props,
             )?;
             daemon.register(service.clone())?;
             announced.push(AnnouncedService {
@@ -102,24 +103,22 @@ pub fn start(
         }
     }
 
-    eprintln!("[Discovery] Announced {} services", announced.len());
-
     let receiver = daemon.browse(SERVICE_TYPE)?;
     let local_ips = interface_ips;
     let local_port = transport.port;
     let local_machine_id = transport.machine_id.clone();
 
-    // Periodic refresh task
+    // Periodic refresh task - re-register services to keep them alive
     let daemon_clone = daemon.clone();
-    let app_clone = app.clone();
     let transport_clone = transport.clone();
     let announced_clone = announced.clone();
+    let machine_id_clone = machine_id.clone();
     tauri::async_runtime::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(DISCOVER_INTERVAL_MS));
         loop {
             interval.tick().await;
-            let list = transport_clone.shared_list().await;
-            let props = build_manifest_properties(&list);
+            let mut props = HashMap::new();
+            props.insert("mid".to_string(), machine_id_clone.clone());
             for service in &announced_clone {
                 if let Ok(updated) = ServiceInfo::new(
                     SERVICE_TYPE,
@@ -132,13 +131,11 @@ pub fn start(
                     let _ = daemon_clone.register(updated);
                 }
             }
-            let _ = app_clone.emit("shared-list-updated", list);
         }
     });
 
     // Discovery thread - runs forever
     thread::spawn(move || {
-        eprintln!("[Discovery] Browser thread started");
         let mut services: HashMap<String, (Vec<IpAddr>, String, u16, String)> = HashMap::new();
         let mut last_emit = std::time::Instant::now();
 
@@ -151,52 +148,49 @@ pub fn start(
                             let port = info.get_port();
                             let addrs: Vec<IpAddr> = info.get_addresses().iter().cloned().collect();
 
-                            eprintln!("[Discovery] Resolved: {} addrs={:?} port={}", fullname, addrs, port);
+                            // Read full machine_id from TXT property, fallback to parsing service name
+                            let (parsed_mid, hostname) = extract_machine_and_hostname(&fullname);
+                            let machine_id = info.get_property_val_str("mid")
+                                .map(|s| s.to_string())
+                                .unwrap_or(parsed_mid);
 
-                            // Extract machine_id and hostname from service name
-                            let (machine_id, hostname) = extract_machine_and_hostname(&fullname);
-
-                            // Skip our own services
+                            // Skip our own services ONLY if both machine_id AND port match
                             if machine_id == local_machine_id && port == local_port {
-                                eprintln!("[Discovery]   -> SKIPPED: own service");
                                 continue;
                             }
 
                             let key = format!("{}:{}", machine_id, port);
-                            services.insert(key.clone(), (addrs, machine_id, port, hostname));
-                            eprintln!("[Discovery]   -> Added service: {} (total unique: {})", key, services.len());
-
-                            if let Some(manifest) = parse_manifest_properties(&info) {
-                                let _ = app.emit("remote-manifest-updated", manifest);
-                            }
+                            services.insert(key, (addrs, machine_id, port, hostname));
 
                             emit_devices(&app, &services, &local_ips);
                             last_emit = std::time::Instant::now();
                         }
                         ServiceEvent::ServiceRemoved(_ty, fullname) => {
-                            eprintln!("[Discovery] Removed: {}", fullname);
-                            let (machine_id, _) = extract_machine_and_hostname(&fullname);
-                            services.retain(|k, _| !k.starts_with(&machine_id));
+                            // Service name is "shortid-port[hostname]", extract the port to find matching entries
+                            let instance = fullname
+                                .trim_end_matches(SERVICE_TYPE)
+                                .trim_end_matches('.');
+                            if let Some(bracket_pos) = instance.find('[') {
+                                let prefix = &instance[..bracket_pos];
+                                if let Some(dash_pos) = prefix.rfind('-') {
+                                    if let Ok(port) = prefix[dash_pos + 1..].parse::<u16>() {
+                                        services.retain(|_, (_, _, p, _)| *p != port);
+                                    }
+                                }
+                            }
                             emit_devices(&app, &services, &local_ips);
                             last_emit = std::time::Instant::now();
-                        }
-                        ServiceEvent::SearchStarted(_) => {
-                            eprintln!("[Discovery] Search started");
-                        }
-                        ServiceEvent::SearchStopped(_) => {
-                            eprintln!("[Discovery] Search stopped");
                         }
                         _ => {}
                     }
                 }
-                Err(e) => {
-                    eprintln!("[Discovery] recv timeout/error: {:?}", e);
+                Err(_) => {
+                    // Timeout — continue with periodic re-emit below
                 }
             }
 
             // Periodic re-emit
             if last_emit.elapsed().as_secs() >= 5 {
-                eprintln!("[Discovery] Periodic re-emit ({} services)", services.len());
                 emit_devices(&app, &services, &local_ips);
                 last_emit = std::time::Instant::now();
             }
@@ -236,7 +230,7 @@ fn emit_devices(app: &AppHandle, services: &HashMap<String, (Vec<IpAddr>, String
         }
 
         if let Some(addr) = best_addr {
-            let dedup_key = machine_id.clone();
+            let dedup_key = format!("{}:{}", machine_id, port);
             let device = DeviceInfo {
                 machine_id: machine_id.clone(),
                 name: hostname.clone(),
@@ -256,11 +250,6 @@ fn emit_devices(app: &AppHandle, services: &HashMap<String, (Vec<IpAddr>, String
     }
 
     let devices: Vec<DeviceInfo> = unique.values().cloned().collect();
-    eprintln!("[Discovery] Emitting {} devices to UI", devices.len());
-    for d in &devices {
-        eprintln!("[Discovery]   -> {} at {}:{}", d.name, d.ip, d.port);
-    }
-
     let _ = app.emit("device-list-updated", devices);
 }
 
@@ -341,48 +330,33 @@ fn is_virtual_interface(name: &str) -> bool {
     patterns.iter().any(|p| lowered.contains(p))
 }
 
-#[allow(dead_code)]
-fn base_service_name(info: &ServiceInfo) -> String {
-    let fullname = info.get_fullname().to_string();
-    base_name_from_fullname(&fullname)
-}
-
-#[allow(dead_code)]
-fn base_name_from_fullname(fullname: &str) -> String {
-    let instance = fullname
-        .trim_end_matches(SERVICE_TYPE)
-        .trim_end_matches('.');
-
-    // Extract base name before ::
-    let base = instance.split("::").next().unwrap_or(instance);
-
-    // Remove port suffix if present (e.g., "hostname:1234" -> "hostname")
-    if let Some((name, port)) = base.rsplit_once(':') {
-        if port.parse::<u16>().is_ok() {
-            return name.to_string();
-        }
-    }
-
-    base.to_string()
-}
-
 fn extract_machine_and_hostname(fullname: &str) -> (String, String) {
     let instance = fullname
         .trim_end_matches(SERVICE_TYPE)
         .trim_end_matches('.');
 
-    // Format is "uuid[hostname]"
+    // Format: "shortid-port[hostname]"
     if let Some(bracket_pos) = instance.find('[') {
         if let Some(close_bracket) = instance.find(']') {
             if bracket_pos < close_bracket {
-                let machine_id = instance[..bracket_pos].to_string();
+                let prefix = &instance[..bracket_pos];
                 let hostname = instance[bracket_pos + 1..close_bracket].to_string();
+                // prefix is "shortid-port", extract shortid as fallback machine_id
+                let machine_id = if let Some(dash_pos) = prefix.rfind('-') {
+                    if prefix[dash_pos + 1..].parse::<u16>().is_ok() {
+                        prefix[..dash_pos].to_string()
+                    } else {
+                        prefix.to_string()
+                    }
+                } else {
+                    prefix.to_string()
+                };
                 return (machine_id, hostname);
             }
         }
     }
 
-    // Fallback to old format for backward compatibility
+    // Fallback
     (instance.to_string(), instance.to_string())
 }
 
@@ -400,30 +374,4 @@ fn ensure_local_domain(name: &str) -> String {
     } else {
         format!("{}.local.", name)
     }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct FileManifest {
-    pub ip: String,
-    pub port: u16,
-    pub files: Vec<crate::transport::SharedEntry>,
-}
-
-fn build_manifest_properties(list: &[crate::transport::SharedEntry]) -> HashMap<String, String> {
-    let payload = serde_json::to_string(list).unwrap_or_else(|_| "[]".to_string());
-    let mut props = HashMap::new();
-    props.insert("manifest".to_string(), payload);
-    props
-}
-
-fn parse_manifest_properties(info: &ServiceInfo) -> Option<crate::discovery::FileManifest> {
-    let ip = info.get_addresses().iter().next().copied()?;
-    let port = info.get_port();
-    let value = info.get_property_val_str("manifest")?;
-    let files: Vec<crate::transport::SharedEntry> = serde_json::from_str(value).ok()?;
-    Some(FileManifest {
-        ip: ip.to_string(),
-        port,
-        files,
-    })
 }

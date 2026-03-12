@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Store } from "@tauri-apps/plugin-store";
 import { startDrag } from "@crabnebula/tauri-plugin-drag";
-import { motion, AnimatePresence } from "framer-motion";
+import { motion } from "framer-motion";
 import "./App.css";
 
 type DeviceInfo = {
@@ -29,12 +30,6 @@ type PullProgress = {
   total_bytes: number;
 };
 
-type FileManifest = {
-  ip: string;
-  port: number;
-  files: SharedEntry[];
-};
-
 type Settings = {
   downloadDir: string;
   maxConcurrent: number;
@@ -56,7 +51,6 @@ const SETTINGS_STORE_PATH = "settings.json";
 function App() {
   const [devices, setDevices] = useState<DeviceInfo[]>([]);
   const [activeDevice, setActiveDevice] = useState<DeviceInfo | null>(null);
-  const [dropActive, setDropActive] = useState(false);
   const [progress, setProgress] = useState(0);
   const [sharedList, setSharedList] = useState<SharedEntry[]>([]);
   const [remoteList, setRemoteList] = useState<SharedEntry[]>([]);
@@ -66,11 +60,70 @@ function App() {
   const [pullingId, setPullingId] = useState<string | null>(null);
   const [pullProgress, setPullProgress] = useState<PullProgress | null>(null);
   const [draggingId, setDraggingId] = useState<string | null>(null);
-const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [settingsLoading, setSettingsLoading] = useState(true);
   const [dropZoneActive, setDropZoneActive] = useState(false);
-  const sharedListRef = useRef<HTMLDivElement>(null);
+  const [localMachineId, setLocalMachineId] = useState<string>("");
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
+  const dropInProgressRef = useRef(false);
+
+  // Group shared files by parent directory
+  const groupedSharedFiles = (() => {
+    const groups: { folder: string; files: SharedEntry[] }[] = [];
+    const folderMap = new Map<string, SharedEntry[]>();
+    const standalone: SharedEntry[] = [];
+
+    for (const entry of sharedList) {
+      const sep = entry.path.includes("/") ? "/" : "\\";
+      const parts = entry.path.split(sep);
+      if (parts.length > 1) {
+        const folder = parts.slice(0, -1).join(sep);
+        if (!folderMap.has(folder)) folderMap.set(folder, []);
+        folderMap.get(folder)!.push(entry);
+      } else {
+        standalone.push(entry);
+      }
+    }
+
+    // Group folders that share a common parent (i.e., came from a drag-in folder)
+    const merged = new Map<string, SharedEntry[]>();
+
+    for (const [folder, files] of folderMap) {
+      // Find if this folder is under another already-known folder
+      let parentKey: string | null = null;
+      for (const existing of merged.keys()) {
+        if (folder.startsWith(existing + "\\") || folder.startsWith(existing + "/")) {
+          parentKey = existing;
+          break;
+        }
+      }
+      if (parentKey) {
+        merged.get(parentKey)!.push(...files);
+      } else {
+        merged.set(folder, [...files]);
+      }
+    }
+
+    for (const [folder, files] of merged) {
+      groups.push({ folder, files });
+    }
+
+    if (standalone.length > 0) {
+      groups.unshift({ folder: "", files: standalone });
+    }
+
+    return groups;
+  })();
+
+  useEffect(() => {
+    invoke<string>("get_local_machine_id_command")
+      .then(setLocalMachineId)
+      .catch((err) => {
+        console.warn("Failed to get local machine ID:", err);
+        setLocalMachineId("");
+      });
+  }, []);
 
   useEffect(() => {
     const unlistenPromise = listen<DeviceInfo[]>("device-list-updated", (event) => {
@@ -97,28 +150,6 @@ const [settingsOpen, setSettingsOpen] = useState(false);
       unlistenPromise.then((unlisten) => unlisten());
     };
   }, []);
-
-  useEffect(() => {
-    const unlistenPromise = listen<SharedEntry[]>("shared-list-updated", (event) => {
-      setSharedList(event.payload ?? []);
-    });
-    return () => {
-      unlistenPromise.then((unlisten) => unlisten());
-    };
-  }, []);
-
-  useEffect(() => {
-    const unlistenPromise = listen<FileManifest>("remote-manifest-updated", (event) => {
-      const manifest = event.payload;
-      if (!manifest || !activeDevice) return;
-      if (manifest.ip === activeDevice.ip && manifest.port === activeDevice.port) {
-        setRemoteList(manifest.files ?? []);
-      }
-    });
-    return () => {
-      unlistenPromise.then((unlisten) => unlisten());
-    };
-  }, [activeDevice]);
 
   useEffect(() => {
     invoke<SharedEntry[]>("list_shared_command").then((list) => setSharedList(list ?? []));
@@ -158,28 +189,43 @@ const [settingsOpen, setSettingsOpen] = useState(false);
     }).then((list) => setRemoteList(list ?? []));
   }, [activeDevice]);
 
-  const onDropFiles = async (files: FileList | null) => {
-    if (!files || files.length === 0) {
-      setDropActive(false);
-      return;
+  const addSharedFiles = async (paths: string[]) => {
+    if (paths.length === 0) return;
+    try {
+      await invoke<SharedEntry[]>("add_shared_command", { paths });
+      const updated = await invoke<SharedEntry[]>("list_shared_command");
+      setSharedList(updated ?? []);
+      setStatusType("success");
+      setStatusMessage(`已添加 ${paths.length} 个文件`);
+    } catch (error) {
+      console.error("add_shared failed:", error);
+      setStatusType("error");
+      setStatusMessage(`添加失败: ${String(error)}`);
     }
-
-    const paths: string[] = [];
-    for (const file of Array.from(files)) {
-      const path = (file as File & { path?: string }).path;
-      if (path) {
-        paths.push(path);
-      }
-    }
-
-    if (paths.length > 0) {
-      const updated = await invoke<SharedEntry[]>("add_shared_command", {
-        paths,
-      });
-      setSharedList((prev) => [...updated, ...prev]);
-    }
-    setDropActive(false);
   };
+
+  // Use Tauri's native drag-drop API to get file paths
+  useEffect(() => {
+    const webview = getCurrentWebview();
+    const unlistenPromise = webview.onDragDropEvent((event) => {
+      if (event.payload.type === "enter") {
+        setDropZoneActive(true);
+      } else if (event.payload.type === "leave") {
+        setDropZoneActive(false);
+      } else if (event.payload.type === "drop") {
+        setDropZoneActive(false);
+        if (dropInProgressRef.current) return;
+        const paths = event.payload.paths;
+        if (paths && paths.length > 0) {
+          dropInProgressRef.current = true;
+          addSharedFiles(paths).finally(() => { dropInProgressRef.current = false; });
+        }
+      }
+    });
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, [addSharedFiles]);
 
   const chooseDownloadDir = async () => {
     const folder = await open({
@@ -296,7 +342,14 @@ return (
             </div>
             <div className="flex items-center gap-2 text-xs text-white/50">
               <span className="flex h-2 w-2 rounded-full bg-emerald-400" />
-              {devices.length > 0 ? `${devices.length} 台设备在线` : "等待设备加入"}
+              {(() => {
+                const remoteDevices = localMachineId
+                  ? devices.filter(d => d.machine_id !== localMachineId)
+                  : devices;
+                return remoteDevices.length > 0
+                  ? `${remoteDevices.length} 台设备在线`
+                  : "等待设备加入";
+              })()}
             </div>
           </div>
           <div className="flex items-center gap-2">
@@ -314,36 +367,11 @@ return (
         <section className="glass-panel flex flex-1 flex-col gap-4 overflow-hidden p-5">
           {/* My Shared Files - Primary Focus */}
           <div
-            ref={sharedListRef}
             className={`relative flex flex-1 flex-col overflow-hidden rounded-2xl border transition-colors ${
               dropZoneActive
                 ? "border-indigo-400/60 bg-indigo-500/10"
                 : "border-white/10 bg-white/5"
             }`}
-            onDragEnter={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              setDropZoneActive(true);
-            }}
-            onDragOver={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              setDropZoneActive(true);
-            }}
-            onDragLeave={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              // Check if we're actually leaving the element
-              if (!sharedListRef.current?.contains(e.relatedTarget as Node)) {
-                setDropZoneActive(false);
-              }
-            }}
-            onDrop={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              setDropZoneActive(false);
-              onDropFiles(e.dataTransfer.files);
-            }}
           >
             {/* List Header */}
             <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
@@ -373,66 +401,80 @@ return (
 
             {/* Empty State / File List */}
             <div className="flex-1 overflow-y-auto p-2">
-              <AnimatePresence>
-                {sharedList.length === 0 ? (
-                  <motion.div
-                    initial={{ opacity: 0, y: 10 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0, y: -10 }}
-                    className="flex h-full flex-col items-center justify-center gap-4 text-center"
-                  >
-                    <div className={`flex h-20 w-20 items-center justify-center rounded-2xl border-2 border-dashed transition-colors ${
-                      dropZoneActive ? "border-indigo-400 bg-indigo-500/20" : "border-white/20 bg-white/5"
-                    }`}>
-                      <svg className="h-8 w-8 text-white/40" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-                      </svg>
-                    </div>
-                    <div>
-                      <p className="text-sm font-medium text-white/80">拖入文件到此区域</p>
-                      <p className="text-xs text-white/40 mt-1">支持多文件、文件夹</p>
-                    </div>
-                  </motion.div>
-                ) : (
-                  <motion.div
-                    initial="hidden"
-                    animate="visible"
-                    variants={{
-                      hidden: { opacity: 0 },
-                      visible: { opacity: 1, transition: { staggerChildren: 0.05 } }
-                    }}
-                    className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
-                  >
-                    {sharedList.map((entry) => (
-                      <motion.div
-                        key={entry.id}
-                        variants={{
-                          hidden: { opacity: 0, scale: 0.95 },
-                          visible: { opacity: 1, scale: 1 }
-                        }}
-                        className="group relative flex flex-col rounded-xl border border-white/10 bg-white/5 p-3 transition hover:border-white/20 hover:bg-white/10"
-                      >
-                        <div className="flex items-start justify-between">
-                          <div className="flex min-w-0 flex-1 items-center gap-2">
-                            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-indigo-500/20">
-                              <svg className="h-5 w-5 text-indigo-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+              {sharedList.length === 0 ? (
+                <div className="flex h-full flex-col items-center justify-center gap-4 text-center">
+                  <div className={`flex h-20 w-20 items-center justify-center rounded-2xl border-2 border-dashed transition-colors ${
+                    dropZoneActive ? "border-indigo-400 bg-indigo-500/20" : "border-white/20 bg-white/5"
+                  }`}>
+                    <svg className="h-8 w-8 text-white/40" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                    </svg>
+                  </div>
+                  <div>
+                    <p className="text-sm font-medium text-white/80">拖入文件到此区域</p>
+                    <p className="text-xs text-white/40 mt-1">支持多文件、文件夹</p>
+                  </div>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {groupedSharedFiles.map((group) => {
+                    const folderName = group.folder
+                      ? group.folder.split(/[\\/]/).pop() || group.folder
+                      : "";
+                    const totalSize = group.files.reduce((s, f) => s + f.size, 0);
+                    const isExpanded = !expandedFolders.has(group.folder);
+
+                    return (
+                      <div key={group.folder || "__standalone__"}>
+                        {/* Folder header (only for actual folders) */}
+                        {group.folder && (
+                          <button
+                            className="flex w-full items-center gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-left transition hover:bg-white/10"
+                            onClick={() => setExpandedFolders((prev) => {
+                              const next = new Set(prev);
+                              if (next.has(group.folder)) next.delete(group.folder);
+                              else next.add(group.folder);
+                              return next;
+                            })}
+                          >
+                            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-amber-500/20">
+                              <svg className="h-4 w-4 text-amber-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
                               </svg>
                             </div>
                             <div className="min-w-0 flex-1">
-                              <p className="truncate text-sm font-medium text-white">{entry.name}</p>
-                              <p className="text-xs text-white/40">
-                                {(entry.size / 1024 / 1024).toFixed(2)} MB
+                              <p className="truncate text-sm font-medium text-white">{folderName}</p>
+                              <p className="text-[10px] text-white/40">
+                                {group.files.length} 个文件 · {(totalSize / 1024 / 1024).toFixed(2)} MB
                               </p>
                             </div>
+                            <svg
+                              className={`h-4 w-4 text-white/40 transition-transform ${isExpanded ? "rotate-90" : ""}`}
+                              fill="none" viewBox="0 0 24 24" stroke="currentColor"
+                            >
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                            </svg>
+                          </button>
+                        )}
+
+                        {/* File items */}
+                        {isExpanded && (
+                          <div className="space-y-1 mt-2">
+                            {group.files.map((entry) => (
+                              <div
+                                key={entry.id}
+                                className="p-2 bg-white/10 rounded text-white text-sm"
+                              >
+                                {entry.name}
+                              </div>
+                            ))}
                           </div>
-                        </div>
-                        <p className="mt-2 truncate text-[10px] text-white/30">{entry.path}</p>
-                      </motion.div>
-                    ))}
-                  </motion.div>
-                )}
-              </AnimatePresence>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
 
             {/* Drop Overlay */}
@@ -451,43 +493,56 @@ return (
           </div>
 
           {/* Bottom Area: Devices + Remote List + Progress */}
-          <div className="grid grid-cols-[220px_1fr_280px] gap-4">
+          <div className="grid grid-cols-[220px_1fr_280px] gap-4 h-48">
             {/* Left: Device List (Compact) */}
             <div className="flex flex-col overflow-hidden rounded-xl border border-white/10 bg-white/5">
               <div className="flex items-center justify-between border-b border-white/10 px-3 py-2">
                 <span className="text-xs font-medium text-white/70">在线设备</span>
-                <span className="text-[10px] text-white/40">{devices.length}</span>
+                <span className="text-[10px] text-white/40">
+                  {(() => {
+                    const remoteDevices = localMachineId
+                      ? devices.filter(d => d.machine_id !== localMachineId)
+                      : devices;
+                    return remoteDevices.length;
+                  })()}
+                </span>
               </div>
               <div className="flex-1 overflow-y-auto p-2">
-                {devices.length === 0 ? (
-                  <div className="flex h-full flex-col items-center justify-center gap-2 text-center">
-                    <div className="h-2 w-2 animate-pulse rounded-full bg-white/20" />
-                    <p className="text-[10px] text-white/30">搜索中...</p>
-                  </div>
-                ) : (
-                  <div className="space-y-1">
-                    {devices.map((device) => {
-                      const active = activeDevice?.machine_id === device.machine_id;
-                      return (
-                        <button
-                          key={device.machine_id}
-                          onClick={() => setActiveDevice(device)}
-                          className={`flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left transition ${
-                            active ? "bg-indigo-500/20" : "hover:bg-white/5"
-                          }`}
-                        >
-                          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-                          <div className="min-w-0 flex-1">
-                            <p className={`truncate text-xs ${active ? "text-white" : "text-white/70"}`}>
-                              {device.name}
-                            </p>
-                            <p className="truncate text-[10px] text-white/40">{device.ip}</p>
-                          </div>
-                        </button>
-                      );
-                    })}
-                  </div>
-                )}
+                {(() => {
+                  const remoteDevices = localMachineId
+                    ? devices.filter(d => d.machine_id !== localMachineId)
+                    : devices;
+                  return remoteDevices.length === 0 ? (
+                    <div className="flex h-full flex-col items-center justify-center gap-2 text-center">
+                      <div className="h-2 w-2 animate-pulse rounded-full bg-white/20" />
+                      <p className="text-[10px] text-white/30">搜索中...</p>
+                    </div>
+                  ) : (
+                    <div className="space-y-1">
+                      {remoteDevices.map((device) => {
+                        const active = activeDevice?.machine_id === device.machine_id && activeDevice?.port === device.port;
+                        return (
+                          <button
+                            key={`${device.machine_id}:${device.port}`}
+                            onClick={() => setActiveDevice(device)}
+                            className={`flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left transition ${
+                              active ? "bg-indigo-500/20" : "hover:bg-white/5"
+                            }`}
+                            title={`${device.name} (${device.machine_id.slice(0, 8)}...)`}
+                          >
+                            <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+                            <div className="min-w-0 flex-1">
+                              <p className={`truncate text-xs ${active ? "text-white" : "text-white/70"}`}>
+                                {device.name}
+                              </p>
+                              <p className="truncate text-[10px] text-white/40">{device.ip}:{device.port}</p>
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  );
+                })()}
               </div>
               {/* Download Dir */}
               <div className="border-t border-white/10 p-2">
@@ -631,7 +686,7 @@ return (
       </div>
 
       {/* Legacy Drop Overlay (for whole window) */}
-      {dropActive && (
+      {dropZoneActive && (
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-white/5 backdrop-blur-sm">
           <div className="glass-card px-8 py-6 text-center">
             <p className="text-lg font-semibold text-white">松开即可发送</p>

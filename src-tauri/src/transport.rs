@@ -335,12 +335,6 @@ pub async fn list_shared(handle: &TransportHandle) -> Result<Vec<SharedEntry>> {
     Ok(handle.shared.list().await)
 }
 
-impl TransportHandle {
-    pub async fn shared_list(&self) -> Vec<SharedEntry> {
-        self.shared.list().await
-    }
-}
-
 pub async fn clear_shared(handle: &TransportHandle) -> Result<()> {
     handle.shared.clear().await;
     Ok(())
