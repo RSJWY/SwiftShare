@@ -1,5 +1,6 @@
 $env:TAURI_DEV_PORT = "1421"
 $env:TAURI_DEV_HOST = "127.0.0.1"
+$env:TAURI_HMR_PORT = "1423"
 $port = 1421
 
 Write-Host "Using dev port $port"

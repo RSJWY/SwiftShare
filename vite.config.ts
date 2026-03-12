@@ -8,6 +8,10 @@ const host = process.env.TAURI_DEV_HOST;
 const devPort = process.env.TAURI_DEV_PORT
   ? Number(process.env.TAURI_DEV_PORT)
   : 1420;
+// @ts-expect-error process is a nodejs global
+const hmrPort = process.env.TAURI_HMR_PORT
+  ? Number(process.env.TAURI_HMR_PORT)
+  : 1421;
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
@@ -26,7 +30,7 @@ export default defineConfig(async () => ({
       ? {
           protocol: "ws",
           host,
-          port: 1421,
+          port: hmrPort,
         }
       : undefined,
     watch: {
