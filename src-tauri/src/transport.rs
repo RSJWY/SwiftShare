@@ -80,6 +80,7 @@ enum PacketType {
     PullRequest = 6,
     PullStream = 7,
     Error = 8,
+    Goodbye = 9,
 }
 
 pub async fn start_transfer(
@@ -109,7 +110,7 @@ pub async fn start_transfer(
     let addr = format!("{}:{}", target_ip, target_port);
     let mut stream = handle
         .outbound_pool
-        .get_or_connect(&target_ip, &addr)
+        .get_or_connect(&addr, &addr)
         .await?;
 
     while let Some(entry) = queue.pop_front() {
@@ -119,7 +120,7 @@ pub async fn start_transfer(
             Err(_) => {
                 stream = handle
                     .outbound_pool
-                    .get_or_connect(&target_ip, &addr)
+                    .get_or_connect(&addr, &addr)
                     .await?;
                 request_resume_offset(&mut stream, &entry).await.unwrap_or(0)
             }
@@ -134,7 +135,7 @@ pub async fn start_transfer(
         if send_result.is_err() {
             stream = handle
                 .outbound_pool
-                .get_or_connect(&target_ip, &addr)
+                .get_or_connect(&addr, &addr)
                 .await?;
             let offset = request_resume_offset(&mut stream, &entry).await.unwrap_or(0);
             if entry.size <= SMALL_FILE_LIMIT {
@@ -147,8 +148,15 @@ pub async fn start_transfer(
         status.sent_files += 1;
     }
 
-    handle.outbound_pool.insert(target_ip, stream).await;
+    handle.outbound_pool.insert(addr, stream).await;
     Ok(())
+}
+
+pub async fn send_goodbye(target_ip: String, target_port: u16) {
+    let addr = format!("{}:{}", target_ip, target_port);
+    if let Ok(mut stream) = TcpStream::connect(&addr).await {
+        let _ = write_packet(&mut stream, PacketType::Goodbye, 0, &[]).await;
+    }
 }
 
 pub async fn start_listener(port: Option<u16>) -> Result<TransportHandle> {
@@ -299,6 +307,8 @@ async fn handle_connection(peer_key: String, pool: ConnectionPool, shared: Share
                 }
                 stream.write_all(&buf[..read]).await?;
             }
+        } else if packet_type == PacketType::Goodbye as u16 {
+            break;
         } else {
             if len > 0 {
                 let mut sink = vec![0u8; len as usize];
@@ -349,7 +359,7 @@ pub async fn fetch_remote_list(
     let addr = format!("{}:{}", target_ip, target_port);
     let mut stream = handle
         .outbound_pool
-        .get_or_connect(&target_ip, &addr)
+        .get_or_connect(&addr, &addr)
         .await?;
     write_packet(&mut stream, PacketType::ListRequest, 0, &[]).await?;
 
@@ -358,7 +368,7 @@ pub async fn fetch_remote_list(
         return Err(anyhow!("Invalid list response"));
     }
     let list: Vec<SharedEntry> = serde_json::from_slice(&payload)?;
-    handle.outbound_pool.insert(target_ip, stream).await;
+    handle.outbound_pool.insert(addr, stream).await;
     Ok(list)
 }
 
@@ -377,7 +387,7 @@ pub async fn pull_file(
     loop {
         let mut stream = handle
             .outbound_pool
-            .get_or_connect(&target_ip, &addr)
+            .get_or_connect(&addr, &addr)
             .await?;
         write_packet(&mut stream, PacketType::PullRequest, 0, entry_id.as_bytes()).await?;
 
@@ -406,7 +416,7 @@ pub async fn pull_file(
 
         match result {
             Ok(_) => {
-                handle.outbound_pool.insert(target_ip, stream).await;
+                handle.outbound_pool.insert(addr, stream).await;
                 return Ok(name);
             }
             Err(err) => {

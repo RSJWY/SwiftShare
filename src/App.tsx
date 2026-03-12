@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Store } from "@tauri-apps/plugin-store";
 import { startDrag } from "@crabnebula/tauri-plugin-drag";
@@ -65,6 +66,7 @@ function App() {
   const [settingsLoading, setSettingsLoading] = useState(true);
   const [dropZoneActive, setDropZoneActive] = useState(false);
   const [localMachineId, setLocalMachineId] = useState<string>("");
+  const [localPort, setLocalPort] = useState<number>(0);
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
   const dropInProgressRef = useRef(false);
 
@@ -123,6 +125,12 @@ function App() {
         console.warn("Failed to get local machine ID:", err);
         setLocalMachineId("");
       });
+    invoke<number>("get_local_port_command")
+      .then(setLocalPort)
+      .catch((err) => {
+        console.warn("Failed to get local port:", err);
+        setLocalPort(0);
+      });
   }, []);
 
   useEffect(() => {
@@ -130,6 +138,18 @@ function App() {
       setDevices(event.payload ?? []);
     });
 
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, []);
+
+  useEffect(() => {
+    const win = getCurrentWindow();
+    const unlistenPromise = win.onCloseRequested(async (event) => {
+      event.preventDefault();
+      await invoke("notify_offline_command").catch(() => {});
+      await win.destroy();
+    });
     return () => {
       unlistenPromise.then((unlisten) => unlisten());
     };
@@ -332,7 +352,7 @@ return (
         <div className="absolute right-0 top-1/3 h-96 w-96 rounded-full bg-cyan-400/30 blur-3xl" />
       </div>
 
-      <div className="relative mx-auto flex h-full max-w-7xl flex-col gap-4 px-6 py-6">
+      <div className="relative mx-auto flex h-full w-full flex-col gap-4 px-6 py-6">
         {/* Header - Compact */}
         <header className="flex items-center justify-between">
           <div className="flex items-center gap-4">
@@ -344,7 +364,7 @@ return (
               <span className="flex h-2 w-2 rounded-full bg-emerald-400" />
               {(() => {
                 const remoteDevices = localMachineId
-                  ? devices.filter(d => d.machine_id !== localMachineId)
+                  ? devices.filter(d => !(d.machine_id === localMachineId && d.port === localPort))
                   : devices;
                 return remoteDevices.length > 0
                   ? `${remoteDevices.length} 台设备在线`
@@ -493,24 +513,34 @@ return (
           </div>
 
           {/* Bottom Area: Devices + Remote List + Progress */}
-          <div className="grid grid-cols-[220px_1fr_280px] gap-4 h-48">
+          <div className="grid grid-cols-[280px_1fr_260px] gap-4 h-56">
             {/* Left: Device List (Compact) */}
             <div className="flex flex-col overflow-hidden rounded-xl border border-white/10 bg-white/5">
               <div className="flex items-center justify-between border-b border-white/10 px-3 py-2">
                 <span className="text-xs font-medium text-white/70">在线设备</span>
-                <span className="text-[10px] text-white/40">
-                  {(() => {
-                    const remoteDevices = localMachineId
-                      ? devices.filter(d => d.machine_id !== localMachineId)
-                      : devices;
-                    return remoteDevices.length;
-                  })()}
-                </span>
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] text-white/40">
+                    {(() => {
+                      const remoteDevices = localMachineId
+                        ? devices.filter(d => !(d.machine_id === localMachineId && d.port === localPort))
+                        : devices;
+                      return remoteDevices.length;
+                    })()}
+                  </span>
+                  <button
+                    className="subtle-button py-0.5 px-1.5 text-[10px]"
+                    onClick={() => invoke("refresh_discovery_command").catch(() => {})}
+                    title="刷新"
+                    type="button"
+                  >
+                    ↻
+                  </button>
+                </div>
               </div>
               <div className="flex-1 overflow-y-auto p-2">
                 {(() => {
                   const remoteDevices = localMachineId
-                    ? devices.filter(d => d.machine_id !== localMachineId)
+                    ? devices.filter(d => !(d.machine_id === localMachineId && d.port === localPort))
                     : devices;
                   return remoteDevices.length === 0 ? (
                     <div className="flex h-full flex-col items-center justify-center gap-2 text-center">
@@ -521,6 +551,7 @@ return (
                     <div className="space-y-1">
                       {remoteDevices.map((device) => {
                         const active = activeDevice?.machine_id === device.machine_id && activeDevice?.port === device.port;
+                        const hasDupName = remoteDevices.filter(d => d.name === device.name).length > 1;
                         return (
                           <button
                             key={`${device.machine_id}:${device.port}`}
@@ -533,7 +564,7 @@ return (
                             <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
                             <div className="min-w-0 flex-1">
                               <p className={`truncate text-xs ${active ? "text-white" : "text-white/70"}`}>
-                                {device.name}
+                                {device.name}{hasDupName ? `:${device.port}` : ""}
                               </p>
                               <p className="truncate text-[10px] text-white/40">{device.ip}:{device.port}</p>
                             </div>

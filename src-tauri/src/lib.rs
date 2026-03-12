@@ -136,6 +136,36 @@ async fn get_local_machine_id_command() -> Result<String, String> {
 }
 
 #[tauri::command]
+async fn get_local_port_command() -> Result<u16, String> {
+    let transport = wait_transport().await?;
+    Ok(transport.port)
+}
+
+#[tauri::command]
+async fn notify_offline_command() -> Result<(), String> {
+    let storage = DISCOVERY_HANDLE
+        .get_or_init(|| Arc::new(Mutex::new(None)))
+        .clone();
+    let guard = storage.lock().await;
+    if let Some(dh) = guard.as_ref() {
+        dh.notify_offline().await;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn refresh_discovery_command() -> Result<(), String> {
+    let storage = DISCOVERY_HANDLE
+        .get_or_init(|| Arc::new(Mutex::new(None)))
+        .clone();
+    let guard = storage.lock().await;
+    if let Some(dh) = guard.as_ref() {
+        dh.request_refresh();
+    }
+    Ok(())
+}
+
+#[tauri::command]
 async fn update_settings_command(
     max_concurrent: u32,
     max_mbps: u64,
@@ -166,6 +196,7 @@ async fn update_settings_command(
 
 static TRANSPORT_HANDLE: std::sync::OnceLock<Arc<Mutex<Option<TransportHandle>>>> = std::sync::OnceLock::new();
 static SETTINGS_STATE: std::sync::OnceLock<Arc<SettingsState>> = std::sync::OnceLock::new();
+static DISCOVERY_HANDLE: std::sync::OnceLock<Arc<Mutex<Option<discovery::DiscoveryHandle>>>> = std::sync::OnceLock::new();
 
 #[derive(Debug)]
 struct SettingsState {
@@ -222,7 +253,13 @@ pub fn run() {
 
                 if let Ok(transport) = start_listener(port).await {
                     let transport = Arc::new(transport);
-                    discovery::start(handle.clone(), transport.clone(), settings.clone()).ok();
+                    if let Ok(dh) = discovery::start(handle.clone(), transport.clone(), settings.clone()) {
+                        let dh_storage = DISCOVERY_HANDLE
+                            .get_or_init(|| Arc::new(Mutex::new(None)))
+                            .clone();
+                        let mut dh_guard = dh_storage.lock().await;
+                        *dh_guard = Some(dh);
+                    }
                     let storage = TRANSPORT_HANDLE
                         .get_or_init(|| Arc::new(Mutex::new(None)))
                         .clone();
@@ -241,6 +278,9 @@ pub fn run() {
             pull_file_command,
             pull_to_temp_command,
             get_local_machine_id_command,
+            get_local_port_command,
+            notify_offline_command,
+            refresh_discovery_command,
             update_settings_command
         ])
         .run(tauri::generate_context!())

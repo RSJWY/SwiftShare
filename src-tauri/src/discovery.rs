@@ -4,6 +4,7 @@ use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::net::TcpStream as StdTcpStream;
 use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
@@ -21,6 +22,24 @@ pub struct DeviceInfo {
 
 pub struct DiscoveryHandle {
     _daemon: ServiceDaemon,
+    known_devices: std::sync::Arc<std::sync::Mutex<Vec<(String, u16)>>>,
+    refresh_tx: std::sync::mpsc::SyncSender<()>,
+}
+
+impl DiscoveryHandle {
+    pub async fn notify_offline(&self) {
+        let devices = {
+            let lock = self.known_devices.lock().unwrap();
+            lock.clone()
+        };
+        for (ip, port) in devices {
+            crate::transport::send_goodbye(ip, port).await;
+        }
+    }
+
+    pub fn request_refresh(&self) {
+        let _ = self.refresh_tx.try_send(());
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +126,10 @@ pub fn start(
     let local_ips = interface_ips;
     let local_port = transport.port;
     let local_machine_id = transport.machine_id.clone();
+    let known_devices: std::sync::Arc<std::sync::Mutex<Vec<(String, u16)>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let known_devices_thread = known_devices.clone();
+    let (refresh_tx, refresh_rx) = std::sync::mpsc::sync_channel::<()>(1);
 
     // Periodic refresh task - re-register services to keep them alive
     let daemon_clone = daemon.clone();
@@ -135,12 +158,29 @@ pub fn start(
     });
 
     // Discovery thread - runs forever
+    let daemon_for_thread = daemon.clone();
+    let announced_for_thread = announced.clone();
+    let machine_id_for_thread = machine_id.clone();
     thread::spawn(move || {
         let mut services: HashMap<String, (Vec<IpAddr>, String, u16, String)> = HashMap::new();
         let mut last_emit = std::time::Instant::now();
+        let mut last_probe = std::time::Instant::now();
+
+        // Helper: sync known_devices from services
+        let sync_known = |svcs: &HashMap<String, (Vec<IpAddr>, String, u16, String)>| {
+            let mut list = Vec::new();
+            for (addrs, _mid, port, _name) in svcs.values() {
+                if let Some(addr) = addrs.first() {
+                    list.push((addr.to_string(), *port));
+                }
+            }
+            if let Ok(mut lock) = known_devices_thread.lock() {
+                *lock = list;
+            }
+        };
 
         loop {
-            match receiver.recv_timeout(Duration::from_secs(30)) {
+            match receiver.recv_timeout(Duration::from_secs(5)) {
                 Ok(event) => {
                     match event {
                         ServiceEvent::ServiceResolved(info) => {
@@ -160,9 +200,29 @@ pub fn start(
                             }
 
                             let key = format!("{}:{}", machine_id, port);
+                            let is_new = !services.contains_key(&key);
                             services.insert(key, (addrs, machine_id, port, hostname));
 
+                            // Re-announce ourselves so the new device can discover us quickly
+                            if is_new {
+                                let mut props = HashMap::new();
+                                props.insert("mid".to_string(), machine_id_for_thread.clone());
+                                for svc in &announced_for_thread {
+                                    if let Ok(updated) = ServiceInfo::new(
+                                        SERVICE_TYPE,
+                                        &svc.instance,
+                                        &svc.host_label,
+                                        svc.ip,
+                                        local_port,
+                                        props.clone(),
+                                    ) {
+                                        let _ = daemon_for_thread.register(updated);
+                                    }
+                                }
+                            }
+
                             emit_devices(&app, &services, &local_ips);
+                            sync_known(&services);
                             last_emit = std::time::Instant::now();
                         }
                         ServiceEvent::ServiceRemoved(_ty, fullname) => {
@@ -179,14 +239,38 @@ pub fn start(
                                 }
                             }
                             emit_devices(&app, &services, &local_ips);
+                            sync_known(&services);
                             last_emit = std::time::Instant::now();
                         }
                         _ => {}
                     }
                 }
                 Err(_) => {
-                    // Timeout — continue with periodic re-emit below
+                    // Timeout — fall through to probe
                 }
+            }
+
+            // Active probe every 5s: TCP connect to each known device, remove unreachable ones
+            if last_probe.elapsed().as_secs() >= 5 {
+                let mut dead_keys: Vec<String> = Vec::new();
+                for (key, (addrs, _mid, port, _name)) in services.iter() {
+                    let reachable = addrs.iter().any(|addr| {
+                        let sa = std::net::SocketAddr::new(*addr, *port);
+                        StdTcpStream::connect_timeout(&sa, Duration::from_millis(500)).is_ok()
+                    });
+                    if !reachable {
+                        dead_keys.push(key.clone());
+                    }
+                }
+                if !dead_keys.is_empty() {
+                    for key in &dead_keys {
+                        services.remove(key);
+                    }
+                    emit_devices(&app, &services, &local_ips);
+                    sync_known(&services);
+                    last_emit = std::time::Instant::now();
+                }
+                last_probe = std::time::Instant::now();
             }
 
             // Periodic re-emit
@@ -194,10 +278,16 @@ pub fn start(
                 emit_devices(&app, &services, &local_ips);
                 last_emit = std::time::Instant::now();
             }
+
+            // Manual refresh request
+            if refresh_rx.try_recv().is_ok() {
+                emit_devices(&app, &services, &local_ips);
+                last_emit = std::time::Instant::now();
+            }
         }
     });
 
-    Ok(DiscoveryHandle { _daemon: daemon })
+    Ok(DiscoveryHandle { _daemon: daemon, known_devices, refresh_tx })
 }
 
 fn emit_devices(app: &AppHandle, services: &HashMap<String, (Vec<IpAddr>, String, u16, String)>, local_ips: &[IpAddr]) {
@@ -206,17 +296,21 @@ fn emit_devices(app: &AppHandle, services: &HashMap<String, (Vec<IpAddr>, String
     for (_key, (addrs, machine_id, port, hostname)) in services {
         let mut best_addr: Option<IpAddr> = None;
 
-        // First prefer routable non-local addresses
-        for addr in addrs {
+        // Prefer V4 over V6 in each pass
+        let mut sorted_addrs: Vec<IpAddr> = addrs.iter().filter(|a| matches!(a, IpAddr::V4(_))).cloned().collect();
+        sorted_addrs.extend(addrs.iter().filter(|a| matches!(a, IpAddr::V6(_))).cloned());
+
+        // First prefer routable non-local V4 addresses
+        for addr in &sorted_addrs {
             if !local_ips.contains(addr) && is_routable(addr) {
                 best_addr = Some(*addr);
                 break;
             }
         }
 
-        // Second prefer local addresses
+        // Second prefer any routable address (including local)
         if best_addr.is_none() {
-            for addr in addrs {
+            for addr in &sorted_addrs {
                 if is_routable(addr) {
                     best_addr = Some(*addr);
                     break;
@@ -225,8 +319,8 @@ fn emit_devices(app: &AppHandle, services: &HashMap<String, (Vec<IpAddr>, String
         }
 
         // Fallback to any address
-        if best_addr.is_none() && !addrs.is_empty() {
-            best_addr = addrs.first().copied();
+        if best_addr.is_none() && !sorted_addrs.is_empty() {
+            best_addr = sorted_addrs.first().copied();
         }
 
         if let Some(addr) = best_addr {
