@@ -11,13 +11,13 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
+use uuid::Uuid;
 
 const MAGIC: &[u8; 4] = b"SWFT";
 const HEADER_LEN: usize = 24;
 const SMALL_FILE_LIMIT: u64 = 1_048_576;
 const RECONNECT_MAX_RETRIES: usize = 5;
 const RECONNECT_BASE_DELAY_MS: u64 = 300;
-const DEFAULT_PORT: u16 = 7878;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TransferStatus {
@@ -38,6 +38,8 @@ pub struct PullProgress {
 #[derive(Clone)]
 pub struct TransportHandle {
     pub port: u16,
+    pub machine_id: String,
+    #[allow(dead_code)]
     inbound_pool: ConnectionPool,
     outbound_pool: ConnectionPool,
     shared: SharedIndex,
@@ -155,6 +157,7 @@ pub async fn start_listener() -> Result<TransportHandle> {
     let pool = ConnectionPool::default();
     let outbound_pool = ConnectionPool::default();
     let shared = SharedIndex::default();
+    let machine_id = generate_machine_id().await;
 
     let pool_clone = pool.clone();
     let shared_clone = shared.clone();
@@ -173,6 +176,7 @@ pub async fn start_listener() -> Result<TransportHandle> {
 
     Ok(TransportHandle {
         port,
+        machine_id,
         inbound_pool: pool,
         outbound_pool,
         shared,
@@ -234,60 +238,65 @@ async fn handle_connection(peer_key: String, pool: ConnectionPool, shared: Share
             let mut payload = vec![0u8; len as usize];
             stream.read_exact(&mut payload).await?;
             let id = String::from_utf8_lossy(&payload).to_string();
-            if let Some(entry) = shared.get(&id).await {
-                let path = PathBuf::from(entry.path.clone());
-                let metadata = fs::metadata(&path).await;
-                let size = metadata.as_ref().map(|m| m.len()).unwrap_or(entry.size);
-                let modified = metadata
-                    .as_ref()
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(entry.modified);
-
-                if size != entry.size || modified != entry.modified {
-                    let msg = format!("Source file changed: {}", entry.name);
+            let entry = match shared.get(&id).await {
+                Some(entry) => entry,
+                None => {
+                    let msg = format!("Entry not found: {}", id);
                     write_packet(&mut stream, PacketType::Error, 0, msg.as_bytes()).await?;
                     continue;
                 }
+            };
 
-                let offset = 0u64;
-                let mut meta_payload = Vec::new();
-                meta_payload.extend_from_slice(&(entry.name.len() as u16).to_be_bytes());
-                meta_payload.extend_from_slice(entry.name.as_bytes());
-                meta_payload.extend_from_slice(&size.to_be_bytes());
-                meta_payload.extend_from_slice(&offset.to_be_bytes());
-                meta_payload.extend_from_slice(&modified.to_be_bytes());
-                write_packet(&mut stream, PacketType::PullStream, 0, &meta_payload).await?;
-
-                let mut file = File::open(&path).await?;
-                if offset > 0 {
-                    file.seek(std::io::SeekFrom::Start(offset)).await?;
+            let path = PathBuf::from(entry.path.clone());
+            let metadata = match fs::metadata(&path).await {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    let msg = format!("Source file missing: {}", entry.name);
+                    write_packet(&mut stream, PacketType::Error, 0, msg.as_bytes()).await?;
+                    continue;
                 }
-                let mut buf = vec![0u8; 64 * 1024];
-                loop {
-                    let read = file.read(&mut buf).await?;
-                    if read == 0 {
-                        break;
-                    }
-                    stream.write_all(&buf[..read]).await?;
+            };
+            let size = metadata.len();
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(entry.modified);
 
-                    let live = fs::metadata(&path).await;
-                    let live_size = live.as_ref().map(|m| m.len()).unwrap_or(size);
-                    let live_modified = live
-                        .as_ref()
-                        .ok()
-                        .and_then(|m| m.modified().ok())
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs())
-                        .unwrap_or(modified);
-                    if live_size != size || live_modified != modified {
-                        let msg = format!("Source file changed during transfer: {}", entry.name);
-                        write_packet(&mut stream, PacketType::Error, 0, msg.as_bytes()).await?;
-                        break;
-                    }
+            if size != entry.size || modified != entry.modified {
+                let msg = format!("Source file changed: {}", entry.name);
+                write_packet(&mut stream, PacketType::Error, 0, msg.as_bytes()).await?;
+                continue;
+            }
+
+            let offset = 0u64;
+            let mut meta_payload = Vec::new();
+            meta_payload.extend_from_slice(&(entry.name.len() as u16).to_be_bytes());
+            meta_payload.extend_from_slice(entry.name.as_bytes());
+            meta_payload.extend_from_slice(&size.to_be_bytes());
+            meta_payload.extend_from_slice(&offset.to_be_bytes());
+            meta_payload.extend_from_slice(&modified.to_be_bytes());
+            write_packet(&mut stream, PacketType::PullStream, 0, &meta_payload).await?;
+
+            let mut file = match File::open(&path).await {
+                Ok(file) => file,
+                Err(_) => {
+                    let msg = format!("Failed to open source file: {}", entry.name);
+                    write_packet(&mut stream, PacketType::Error, 0, msg.as_bytes()).await?;
+                    continue;
                 }
+            };
+            if offset > 0 {
+                file.seek(std::io::SeekFrom::Start(offset)).await?;
+            }
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let read = file.read(&mut buf).await?;
+                if read == 0 {
+                    break;
+                }
+                stream.write_all(&buf[..read]).await?;
             }
         } else {
             if len > 0 {
@@ -326,6 +335,12 @@ pub async fn list_shared(handle: &TransportHandle) -> Result<Vec<SharedEntry>> {
     Ok(handle.shared.list().await)
 }
 
+impl TransportHandle {
+    pub async fn shared_list(&self) -> Vec<SharedEntry> {
+        self.shared.list().await
+    }
+}
+
 pub async fn clear_shared(handle: &TransportHandle) -> Result<()> {
     handle.shared.clear().await;
     Ok(())
@@ -360,10 +375,9 @@ pub async fn pull_file(
     dest_dir: String,
     max_mbps: u64,
     mut on_progress: impl FnMut(PullProgress) + Send,
-) -> Result<()> {
+) -> Result<String> {
     let addr = format!("{}:{}", target_ip, target_port);
     let mut attempt = 0;
-    let mut last_error: Option<anyhow::Error> = None;
 
     loop {
         let mut stream = handle
@@ -398,12 +412,11 @@ pub async fn pull_file(
         match result {
             Ok(_) => {
                 handle.outbound_pool.insert(target_ip, stream).await;
-                return Ok(());
+                return Ok(name);
             }
             Err(err) => {
-                last_error = Some(err);
                 if attempt >= RECONNECT_MAX_RETRIES {
-                    return Err(last_error.unwrap_or_else(|| anyhow!("Pull failed")));
+                    return Err(err);
                 }
                 attempt += 1;
                 let delay = RECONNECT_BASE_DELAY_MS * attempt as u64;
@@ -797,4 +810,53 @@ async fn read_packet(stream: &mut TcpStream) -> Result<(u16, Vec<u8>)> {
         stream.read_exact(&mut payload).await?;
     }
     Ok((packet_type, payload))
+}
+
+async fn generate_machine_id() -> String {
+    let id_file = get_machine_id_path();
+
+    // Try to read existing ID
+    if let Ok(content) = tokio::fs::read_to_string(&id_file).await {
+        if !content.trim().is_empty() {
+            return content.trim().to_string();
+        }
+    }
+
+    // Generate new ID
+    let new_id = Uuid::new_v4().to_string();
+
+    // Try to persist it
+    if let Some(parent) = id_file.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    let _ = tokio::fs::write(&id_file, &new_id).await;
+
+    new_id
+}
+
+fn get_machine_id_path() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        use std::path::PathBuf;
+        PathBuf::from(
+            std::env::var("APPDATA")
+                .unwrap_or_else(|_| ".".to_string())
+        ).join("SwiftShare").join(".machine_id")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::path::PathBuf;
+        PathBuf::from(
+            std::env::var("HOME")
+                .unwrap_or_else(|_| ".".to_string())
+        ).join("Library").join("Application Support").join("SwiftShare").join(".machine_id")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::path::PathBuf;
+        PathBuf::from(
+            std::env::var("HOME")
+                .unwrap_or_else(|_| ".".to_string())
+        ).join(".local").join("share").join("swiftshare").join(".machine_id")
+    }
 }

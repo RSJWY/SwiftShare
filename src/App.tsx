@@ -1,13 +1,14 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Store } from "@tauri-apps/plugin-store";
-import { motion } from "framer-motion";
+import { startDrag } from "@crabnebula/tauri-plugin-drag";
+import { motion, AnimatePresence } from "framer-motion";
 import "./App.css";
 
 type DeviceInfo = {
+  machine_id: string;
   name: string;
   ip: string;
   port: number;
@@ -26,6 +27,12 @@ type PullProgress = {
   name: string;
   received_bytes: number;
   total_bytes: number;
+};
+
+type FileManifest = {
+  ip: string;
+  port: number;
+  files: SharedEntry[];
 };
 
 type Settings = {
@@ -58,10 +65,12 @@ function App() {
   const [statusType, setStatusType] = useState<"success" | "error" | "info">("info");
   const [pullingId, setPullingId] = useState<string | null>(null);
   const [pullProgress, setPullProgress] = useState<PullProgress | null>(null);
-  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+const [settingsOpen, setSettingsOpen] = useState(false);
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [settingsLoading, setSettingsLoading] = useState(true);
-  const emptyState = useMemo(() => devices.length === 0, [devices.length]);
+  const [dropZoneActive, setDropZoneActive] = useState(false);
+  const sharedListRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const unlistenPromise = listen<DeviceInfo[]>("device-list-updated", (event) => {
@@ -88,6 +97,28 @@ function App() {
       unlistenPromise.then((unlisten) => unlisten());
     };
   }, []);
+
+  useEffect(() => {
+    const unlistenPromise = listen<SharedEntry[]>("shared-list-updated", (event) => {
+      setSharedList(event.payload ?? []);
+    });
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, []);
+
+  useEffect(() => {
+    const unlistenPromise = listen<FileManifest>("remote-manifest-updated", (event) => {
+      const manifest = event.payload;
+      if (!manifest || !activeDevice) return;
+      if (manifest.ip === activeDevice.ip && manifest.port === activeDevice.port) {
+        setRemoteList(manifest.files ?? []);
+      }
+    });
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, [activeDevice]);
 
   useEffect(() => {
     invoke<SharedEntry[]>("list_shared_command").then((list) => setSharedList(list ?? []));
@@ -221,198 +252,270 @@ function App() {
     }
   };
 
-  return (
-    <main
-      className="relative h-full overflow-hidden"
-      onDragOver={(event) => {
-        event.preventDefault();
-        setDropActive(true);
-      }}
-      onDragLeave={() => setDropActive(false)}
-      onDrop={(event) => {
-        event.preventDefault();
-        onDropFiles(event.dataTransfer.files);
-      }}
-    >
+  const dragRemoteEntry = async (entry: SharedEntry) => {
+    if (!activeDevice || draggingId) return;
+    setDraggingId(entry.id);
+    setStatusType("info");
+    setStatusMessage(`准备拖出 ${entry.name}...`);
+    try {
+      const path = await invoke<string>("pull_to_temp_command", {
+        entryId: entry.id,
+        targetIp: activeDevice.ip,
+        targetPort: activeDevice.port,
+      });
+      await startDrag({
+        item: [path],
+        icon: path,
+      });
+      setStatusType("success");
+      setStatusMessage(`已准备拖出 ${entry.name}`);
+    } catch (error) {
+      console.error(error);
+      setStatusType("error");
+      setStatusMessage(`拖出失败: ${String(error)}`);
+    } finally {
+      setDraggingId(null);
+    }
+  };
+
+return (
+    <main className="relative h-full overflow-hidden">
+      {/* Background Effects */}
       <div className="pointer-events-none absolute inset-0 opacity-40">
         <div className="absolute -left-24 -top-24 h-72 w-72 rounded-full bg-indigo-500/40 blur-3xl" />
         <div className="absolute right-0 top-1/3 h-96 w-96 rounded-full bg-cyan-400/30 blur-3xl" />
       </div>
 
-      <div className="relative mx-auto flex h-full max-w-6xl flex-col gap-6 px-6 py-8">
-        <header className="flex items-center justify-between" data-tauri-drag-region>
-          <div>
-            <p className="text-xs uppercase tracking-[0.4em] text-indigo-200/70">SwiftShare</p>
-            <h1 className="text-3xl font-semibold text-white">局域网极速传输</h1>
-            <p className="text-sm text-white/60">拖拽文件到窗口，极速发送</p>
+      <div className="relative mx-auto flex h-full max-w-7xl flex-col gap-4 px-6 py-6">
+        {/* Header - Compact */}
+        <header className="flex items-center justify-between">
+          <div className="flex items-center gap-4">
+            <div>
+              <p className="text-xs uppercase tracking-[0.3em] text-indigo-200/70">SwiftShare</p>
+              <h1 className="text-xl font-semibold text-white">局域网文件共享</h1>
+            </div>
+            <div className="flex items-center gap-2 text-xs text-white/50">
+              <span className="flex h-2 w-2 rounded-full bg-emerald-400" />
+              {devices.length > 0 ? `${devices.length} 台设备在线` : "等待设备加入"}
+            </div>
           </div>
           <div className="flex items-center gap-2">
             <button
-              className="subtle-button"
-              data-tauri-drag-region="false"
+              className="subtle-button text-xs"
               onClick={() => setSettingsOpen(true)}
               type="button"
             >
               设置
             </button>
-            <button className="glow-button" data-tauri-drag-region="false">新建传输</button>
-            <button
-              className="close-button"
-              data-tauri-drag-region="false"
-              onClick={() => {
-                void getCurrentWindow().close();
-              }}
-              aria-label="关闭窗口"
-              title="关闭"
-              type="button"
-            >
-              ×
-            </button>
           </div>
         </header>
 
-        <section className="glass-panel grid flex-1 grid-cols-[280px_1fr] gap-6 p-6">
-          <aside className="flex flex-col gap-4">
-            <div className="flex items-center justify-between">
-              <h2 className="text-sm font-semibold text-white">在线设备</h2>
-              <span className="rounded-full bg-white/10 px-3 py-1 text-xs text-white/60">
-                {devices.length} 在线
-              </span>
-            </div>
-
-            <div className="glass-card flex-1 space-y-2 p-3">
-              {emptyState && (
-                <div className="flex h-full flex-col items-center justify-center gap-3 text-center text-white/40">
-                  <div className="h-12 w-12 rounded-full border border-dashed border-white/20" />
-                  <p className="text-sm">等待设备加入局域网</p>
-                </div>
-              )}
-
-              {devices.map((device) => {
-                const active = activeDevice?.ip === device.ip;
-                return (
+{/* Main Layout - Single Shared List Focus */}
+        <section className="glass-panel flex flex-1 flex-col gap-4 overflow-hidden p-5">
+          {/* My Shared Files - Primary Focus */}
+          <div
+            ref={sharedListRef}
+            className={`relative flex flex-1 flex-col overflow-hidden rounded-2xl border transition-colors ${
+              dropZoneActive
+                ? "border-indigo-400/60 bg-indigo-500/10"
+                : "border-white/10 bg-white/5"
+            }`}
+            onDragEnter={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              setDropZoneActive(true);
+            }}
+            onDragOver={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              setDropZoneActive(true);
+            }}
+            onDragLeave={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              // Check if we're actually leaving the element
+              if (!sharedListRef.current?.contains(e.relatedTarget as Node)) {
+                setDropZoneActive(false);
+              }
+            }}
+            onDrop={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              setDropZoneActive(false);
+              onDropFiles(e.dataTransfer.files);
+            }}
+          >
+            {/* List Header */}
+            <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
+              <div className="flex items-center gap-3">
+                <h2 className="text-sm font-semibold text-white">共享文件</h2>
+                <span className="rounded-full bg-indigo-500/20 px-2 py-0.5 text-xs text-indigo-200">
+                  {sharedList.length} 项
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-white/40">
+                  {sharedList.length === 0 ? "拖入文件到此处" : "局域网内所有设备可访问"}
+                </span>
+                {sharedList.length > 0 && (
                   <button
-                    key={`${device.ip}:${device.port}`}
-                    onClick={() => setActiveDevice(device)}
-                    className={`flex w-full items-center justify-between rounded-2xl px-3 py-3 text-left text-sm transition ${
-                      active ? "bg-indigo-500/20 text-white" : "bg-white/5 text-white/70 hover:bg-white/10"
-                    }`}
+                    className="subtle-button text-xs"
+                    onClick={async () => {
+                      await invoke("clear_shared_command");
+                      setSharedList([]);
+                    }}
                   >
-                    <div>
-                      <p className="font-medium">{device.name.replace("._swiftshare._tcp.local.", "")}</p>
-                      <p className="text-xs text-white/50">
-                        {device.ip}:{device.port}
-                      </p>
-                    </div>
-                    <span className={`h-2 w-2 rounded-full ${active ? "bg-indigo-400" : "bg-emerald-400"}`} />
+                    清空
                   </button>
-                );
-              })}
-            </div>
-            <div className="glass-card p-4">
-              <p className="text-xs text-white/50">下载目录</p>
-              <div className="mt-2 flex items-center gap-2">
-                <button className="subtle-button" onClick={chooseDownloadDir}>
-                  选择目录
-                </button>
-                <span className="truncate text-xs text-white/60">{downloadDir || "未选择"}</span>
+                )}
               </div>
             </div>
-          </aside>
 
-          <section className="flex flex-col gap-6">
-            <div className="glass-card flex-1 p-6">
-              <div className="flex items-start justify-between">
-                <div>
-                  <h3 className="text-lg font-semibold text-white">传输进度</h3>
-                  <p className="text-sm text-white/60">连续流传输，聚合小文件提升速度</p>
-                </div>
-                <button className="subtle-button">查看历史</button>
-              </div>
-
-              {statusMessage && (
-                <div
-                  className={`mt-4 rounded-2xl px-4 py-3 text-sm ${
-                    statusType === "success"
-                      ? "bg-emerald-500/15 text-emerald-200"
-                      : statusType === "error"
-                        ? "bg-rose-500/15 text-rose-200"
-                        : "bg-white/10 text-white/70"
-                  }`}
-                >
-                  {statusMessage}
-                </div>
-              )}
-
-              <div className="mt-6 space-y-4">
-                <div className="flex items-center justify-between text-sm text-white/70">
-                  <span>{pullProgress ? pullProgress.name : "当前任务"}</span>
-                  <span>{progress}%</span>
-                </div>
-                <div className="h-3 rounded-full bg-white/10">
+            {/* Empty State / File List */}
+            <div className="flex-1 overflow-y-auto p-2">
+              <AnimatePresence>
+                {sharedList.length === 0 ? (
                   <motion.div
-                    className="h-3 rounded-full bg-gradient-to-r from-indigo-500 to-cyan-400"
-                    initial={{ width: 0 }}
-                    animate={{ width: `${progress}%` }}
-                    transition={{ duration: 0.6, ease: "easeOut" }}
-                  />
-                </div>
-              </div>
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -10 }}
+                    className="flex h-full flex-col items-center justify-center gap-4 text-center"
+                  >
+                    <div className={`flex h-20 w-20 items-center justify-center rounded-2xl border-2 border-dashed transition-colors ${
+                      dropZoneActive ? "border-indigo-400 bg-indigo-500/20" : "border-white/20 bg-white/5"
+                    }`}>
+                      <svg className="h-8 w-8 text-white/40" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                      </svg>
+                    </div>
+                    <div>
+                      <p className="text-sm font-medium text-white/80">拖入文件到此区域</p>
+                      <p className="text-xs text-white/40 mt-1">支持多文件、文件夹</p>
+                    </div>
+                  </motion.div>
+                ) : (
+                  <motion.div
+                    initial="hidden"
+                    animate="visible"
+                    variants={{
+                      hidden: { opacity: 0 },
+                      visible: { opacity: 1, transition: { staggerChildren: 0.05 } }
+                    }}
+                    className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
+                  >
+                    {sharedList.map((entry) => (
+                      <motion.div
+                        key={entry.id}
+                        variants={{
+                          hidden: { opacity: 0, scale: 0.95 },
+                          visible: { opacity: 1, scale: 1 }
+                        }}
+                        className="group relative flex flex-col rounded-xl border border-white/10 bg-white/5 p-3 transition hover:border-white/20 hover:bg-white/10"
+                      >
+                        <div className="flex items-start justify-between">
+                          <div className="flex min-w-0 flex-1 items-center gap-2">
+                            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-indigo-500/20">
+                              <svg className="h-5 w-5 text-indigo-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                              </svg>
+                            </div>
+                            <div className="min-w-0 flex-1">
+                              <p className="truncate text-sm font-medium text-white">{entry.name}</p>
+                              <p className="text-xs text-white/40">
+                                {(entry.size / 1024 / 1024).toFixed(2)} MB
+                              </p>
+                            </div>
+                          </div>
+                        </div>
+                        <p className="mt-2 truncate text-[10px] text-white/30">{entry.path}</p>
+                      </motion.div>
+                    ))}
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
 
-              <div className="mt-8 grid grid-cols-2 gap-4">
-                <div className="glass-card p-4">
-                  <p className="text-xs text-white/50">目标设备</p>
-                  <p className="text-sm font-medium text-white">
-                    {activeDevice ? activeDevice.name : "未选择"}
-                  </p>
+            {/* Drop Overlay */}
+            {dropZoneActive && (
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                className="pointer-events-none absolute inset-0 flex items-center justify-center bg-indigo-500/10 backdrop-blur-sm"
+              >
+                <div className="rounded-2xl border border-indigo-400/60 bg-indigo-500/20 px-8 py-6 text-center">
+                  <p className="text-lg font-semibold text-white">松开添加文件</p>
+                  <p className="text-sm text-indigo-200/70">将共享给局域网内所有设备</p>
                 </div>
-                <div className="glass-card p-4">
-                  <p className="text-xs text-white/50">传输策略</p>
-                  <p className="text-sm font-medium text-white">拉取 + 断线重连</p>
+              </motion.div>
+            )}
+          </div>
+
+          {/* Bottom Area: Devices + Remote List + Progress */}
+          <div className="grid grid-cols-[220px_1fr_280px] gap-4">
+            {/* Left: Device List (Compact) */}
+            <div className="flex flex-col overflow-hidden rounded-xl border border-white/10 bg-white/5">
+              <div className="flex items-center justify-between border-b border-white/10 px-3 py-2">
+                <span className="text-xs font-medium text-white/70">在线设备</span>
+                <span className="text-[10px] text-white/40">{devices.length}</span>
+              </div>
+              <div className="flex-1 overflow-y-auto p-2">
+                {devices.length === 0 ? (
+                  <div className="flex h-full flex-col items-center justify-center gap-2 text-center">
+                    <div className="h-2 w-2 animate-pulse rounded-full bg-white/20" />
+                    <p className="text-[10px] text-white/30">搜索中...</p>
+                  </div>
+                ) : (
+                  <div className="space-y-1">
+                    {devices.map((device) => {
+                      const active = activeDevice?.machine_id === device.machine_id;
+                      return (
+                        <button
+                          key={device.machine_id}
+                          onClick={() => setActiveDevice(device)}
+                          className={`flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left transition ${
+                            active ? "bg-indigo-500/20" : "hover:bg-white/5"
+                          }`}
+                        >
+                          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+                          <div className="min-w-0 flex-1">
+                            <p className={`truncate text-xs ${active ? "text-white" : "text-white/70"}`}>
+                              {device.name}
+                            </p>
+                            <p className="truncate text-[10px] text-white/40">{device.ip}</p>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+              {/* Download Dir */}
+              <div className="border-t border-white/10 p-2">
+                <p className="text-[10px] text-white/40">下载目录</p>
+                <div className="mt-1 flex items-center gap-1">
+                  <button
+                    className="subtle-button py-1 px-2 text-[10px]"
+                    onClick={chooseDownloadDir}
+                  >
+                    选择
+                  </button>
+                  <span className="truncate text-[10px] text-white/40">
+                    {downloadDir ? downloadDir.split(/[\\/]/).pop() : "未设置"}
+                  </span>
                 </div>
               </div>
             </div>
 
-            <div className="grid grid-cols-2 gap-4">
-              <div className="glass-card p-5">
-                <div className="flex items-center justify-between">
-                  <p className="text-sm text-white/70">我的共享</p>
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs text-white/40">{sharedList.length} 项</span>
-                    <button
-                      className="subtle-button"
-                      onClick={async () => {
-                        await invoke("clear_shared_command");
-                        setSharedList([]);
-                      }}
-                    >
-                      清空
-                    </button>
-                  </div>
-                </div>
-                <div className="mt-4 space-y-2">
-                  {sharedList.length === 0 && (
-                    <p className="text-xs text-white/40">拖拽文件进来即可共享</p>
-                  )}
-                  {sharedList.map((entry) => (
-                    <div key={entry.id} className="flex items-center justify-between rounded-xl bg-white/5 px-3 py-2">
-                      <div>
-                        <p className="text-sm text-white/80">{entry.name}</p>
-                        <p className="text-[11px] text-white/40">{entry.path}</p>
-                      </div>
-                      <span className="text-xs text-white/50">{Math.round(entry.size / 1024)} KB</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              <div className="glass-card p-5">
-                <div className="flex items-center justify-between">
-                  <p className="text-sm text-white/70">对方共享</p>
+            {/* Middle: Remote Shared List */}
+            <div className="flex flex-col overflow-hidden rounded-xl border border-white/10 bg-white/5">
+              <div className="flex items-center justify-between border-b border-white/10 px-3 py-2">
+                <span className="text-xs font-medium text-white/70">
+                  {activeDevice ? `来自「${activeDevice.name}」` : "选择设备查看共享"}
+                </span>
+                {activeDevice && (
                   <button
-                    className="subtle-button"
+                    className="subtle-button py-1 px-2 text-[10px]"
                     onClick={() =>
-                      activeDevice &&
                       invoke<SharedEntry[]>("fetch_remote_list_command", {
                         targetIp: activeDevice.ip,
                         targetPort: activeDevice.port,
@@ -421,39 +524,118 @@ function App() {
                   >
                     刷新
                   </button>
-                </div>
-                <div className="mt-4 space-y-2">
-                  {!activeDevice && <p className="text-xs text-white/40">先选择设备</p>}
-                  {activeDevice && remoteList.length === 0 && (
-                    <p className="text-xs text-white/40">暂无共享</p>
-                  )}
-                  {remoteList.map((entry) => (
-                    <div key={entry.id} className="flex items-center justify-between rounded-xl bg-white/5 px-3 py-2">
-                      <div>
-                        <p className="text-sm text-white/80">{entry.name}</p>
-                        <p className="text-[11px] text-white/40">{Math.round(entry.size / 1024)} KB</p>
-                      </div>
-                      <button
-                        className="glow-button disabled:cursor-not-allowed disabled:opacity-50"
-                        onClick={() => pullEntry(entry)}
-                        disabled={!downloadDir || pullingId === entry.id}
+                )}
+              </div>
+              <div className="flex-1 overflow-y-auto p-2">
+                {!activeDevice ? (
+                  <div className="flex h-full items-center justify-center text-center">
+                    <p className="text-xs text-white/30">点击左侧设备查看其共享</p>
+                  </div>
+                ) : remoteList.length === 0 ? (
+                  <div className="flex h-full items-center justify-center text-center">
+                    <p className="text-xs text-white/30">该设备暂无共享文件</p>
+                  </div>
+                ) : (
+                  <div className="space-y-1">
+                    {remoteList.map((entry) => (
+                      <div
+                        key={entry.id}
+                        className="flex items-center gap-2 rounded-lg bg-white/5 px-2 py-2 hover:bg-white/10"
                       >
-                        {pullingId === entry.id ? "拉取中" : "拉取"}
-                      </button>
-                    </div>
-                  ))}
-                </div>
+                        <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded bg-indigo-500/20">
+                          <svg className="h-3 w-3 text-indigo-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                          </svg>
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-xs text-white/80">{entry.name}</p>
+                          <p className="text-[10px] text-white/40">{(entry.size / 1024 / 1024).toFixed(2)} MB</p>
+                        </div>
+                        <div className="flex shrink-0 gap-1">
+                          <button
+                            className="rounded bg-indigo-500/80 px-2 py-1 text-[10px] text-white transition hover:bg-indigo-400 disabled:opacity-50"
+                            onClick={() => pullEntry(entry)}
+                            disabled={!downloadDir || pullingId === entry.id}
+                          >
+                            {pullingId === entry.id ? "..." : "拉取"}
+                          </button>
+                          <button
+                            className="rounded border border-white/10 bg-white/5 px-2 py-1 text-[10px] text-white/70 transition hover:bg-white/10"
+                            onMouseDown={(e) => {
+                              e.preventDefault();
+                              void dragRemoteEntry(entry);
+                            }}
+                            disabled={draggingId === entry.id || !activeDevice}
+                            title="拖出到文件夹"
+                          >
+                            {draggingId === entry.id ? "..." : "拖出"}
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
-          </section>
+
+            {/* Right: Transfer Progress (Simplified) */}
+            <div className="flex flex-col overflow-hidden rounded-xl border border-white/10 bg-white/5">
+              <div className="flex items-center border-b border-white/10 px-3 py-2">
+                <span className="text-xs font-medium text-white/70">传输状态</span>
+              </div>
+              <div className="flex flex-1 flex-col justify-center gap-3 p-3">
+                {/* Status Message */}
+                {statusMessage && (
+                  <div
+                    className={`rounded-lg px-3 py-2 text-[11px] ${
+                      statusType === "success"
+                        ? "bg-emerald-500/15 text-emerald-200"
+                        : statusType === "error"
+                        ? "bg-rose-500/15 text-rose-200"
+                        : "bg-white/10 text-white/70"
+                    }`}
+                  >
+                    {statusMessage}
+                  </div>
+                )}
+
+                {/* Current Transfer */}
+                {pullProgress ? (
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between text-xs text-white/50">
+                      <span className="truncate">{pullProgress.name}</span>
+                      <span>{progress}%</span>
+                    </div>
+                    <div className="h-1.5 overflow-hidden rounded-full bg-white/10">
+                      <motion.div
+                        className="h-1.5 rounded-full bg-gradient-to-r from-indigo-500 to-cyan-400"
+                        initial={{ width: 0 }}
+                        animate={{ width: `${progress}%` }}
+                        transition={{ duration: 0.3, ease: "easeOut" }}
+                      />
+                    </div>
+                    <div className="text-[10px] text-white/40">
+                      {(pullProgress.received_bytes / 1024 / 1024).toFixed(2)} / {" "}
+                      {(pullProgress.total_bytes / 1024 / 1024).toFixed(2)} MB
+                    </div>
+                  </div>
+                ) : (
+                  <div className="text-center text-white/30">
+                    <p className="text-xs">空闲中</p>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
         </section>
       </div>
 
+      {/* Legacy Drop Overlay (for whole window) */}
       {dropActive && (
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-white/5 backdrop-blur-sm">
           <div className="glass-card px-8 py-6 text-center">
             <p className="text-lg font-semibold text-white">松开即可发送</p>
-            <p className="text-xs text-white/50">将文件传输到选中的设备</p>
+            <p className="text-xs text-white/50">将文件添加到共享列表</p>
           </div>
         </div>
       )}
