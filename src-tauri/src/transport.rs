@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use crc32fast::Hasher as Crc32Hasher;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -16,6 +17,7 @@ use uuid::Uuid;
 const MAGIC: &[u8; 4] = b"SWFT";
 const HEADER_LEN: usize = 24;
 const SMALL_FILE_LIMIT: u64 = 1_048_576;
+const INLINE_FILE_LIMIT: u64 = 65_536; // files <= 64KB are inlined in the meta packet
 const RECONNECT_MAX_RETRIES: usize = 5;
 const RECONNECT_BASE_DELAY_MS: u64 = 300;
 
@@ -62,6 +64,14 @@ pub struct SharedEntry {
     pub path: String,
     pub size: u64,
     pub modified: u64,
+    /// Relative path from the shared root (e.g. "MyFolder/sub/file.txt").
+    /// For top-level files this equals `name`. For directories this is the
+    /// root folder name (e.g. "MyFolder") with is_dir = true.
+    #[serde(default)]
+    pub relative_path: String,
+    /// True when this entry represents a directory root.
+    #[serde(default)]
+    pub is_dir: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +91,21 @@ enum PacketType {
     PullStream = 7,
     Error = 8,
     Goodbye = 9,
+    /// A single file within a directory pull. Payload format is the same as
+    /// PullStream but the name field contains the relative path within the
+    /// directory (e.g. "MyFolder/sub/file.txt").
+    DirFileStream = 10,
+    /// Signals the end of a directory pull.
+    DirEnd = 11,
+    /// Request the flat file list for a directory entry (by id).
+    DirListRequest = 12,
+    /// Response: JSON array of relative path strings.
+    DirListResponse = 13,
+    /// Single file pull, small enough to inline content in the meta packet.
+    /// Payload: meta (same as PullStream) + file_bytes + 4-byte CRC32 (big-endian).
+    PullInline = 14,
+    /// Directory file, small enough to inline. Same layout as PullInline.
+    DirFileInline = 15,
 }
 
 pub async fn start_transfer(
@@ -229,7 +254,7 @@ async fn handle_connection(peer_key: String, pool: ConnectionPool, shared: Share
             let mut payload = vec![0u8; len as usize];
             stream.read_exact(&mut payload).await?;
             let (path, size, offset) = parse_meta(&payload)?;
-            receive_streamed_file(&mut stream, PathBuf::from(path), size, offset, 0, |_| {}).await?;
+            receive_streamed_file(&mut stream, PathBuf::from(path), size, offset, 0, 0, |_| {}).await?;
         } else if packet_type == PacketType::FileChunk as u16 {
             let mut payload = vec![0u8; len as usize];
             stream.read_exact(&mut payload).await?;
@@ -256,57 +281,159 @@ async fn handle_connection(peer_key: String, pool: ConnectionPool, shared: Share
                 }
             };
 
-            let path = PathBuf::from(entry.path.clone());
-            let metadata = match fs::metadata(&path).await {
-                Ok(metadata) => metadata,
-                Err(_) => {
-                    let msg = format!("Source file missing: {}", entry.name);
+            if entry.is_dir {
+                // Send all files in the directory tree, each as a DirFileStream packet.
+                let dir_path = PathBuf::from(&entry.path);
+                let mut file_queue = VecDeque::new();
+                collect_files(&dir_path, &mut file_queue)?;
+                // parent of dir_path, so relative paths start with the dir name
+                let base = dir_path.parent().unwrap_or(&dir_path);
+                for file_entry in file_queue {
+                    let rel = file_entry.path.strip_prefix(base)
+                        .unwrap_or(&file_entry.path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let file_meta = match fs::metadata(&file_entry.path).await {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    let size = file_meta.len();
+                    let modified = file_meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let mut meta_payload = Vec::new();
+                    meta_payload.extend_from_slice(&(rel.len() as u16).to_be_bytes());
+                    meta_payload.extend_from_slice(rel.as_bytes());
+                    meta_payload.extend_from_slice(&size.to_be_bytes());
+                    meta_payload.extend_from_slice(&0u64.to_be_bytes()); // offset
+                    meta_payload.extend_from_slice(&modified.to_be_bytes());
+                    if size <= INLINE_FILE_LIMIT {
+                        // Read entire file, compute CRC32, inline everything
+                        let file_bytes = match fs::read(&file_entry.path).await {
+                            Ok(b) => b,
+                            Err(_) => continue,
+                        };
+                        let crc = crc32_of(&file_bytes);
+                        meta_payload.extend_from_slice(&file_bytes);
+                        meta_payload.extend_from_slice(&crc.to_be_bytes());
+                        write_packet(&mut stream, PacketType::DirFileInline, 0, &meta_payload).await?;
+                    } else {
+                        // Stream large file, append CRC32 after data
+                        let crc = match crc32_of_file(&file_entry.path).await {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        };
+                        meta_payload.extend_from_slice(&crc.to_be_bytes());
+                        write_packet(&mut stream, PacketType::DirFileStream, 0, &meta_payload).await?;
+                        let mut file = match File::open(&file_entry.path).await {
+                            Ok(f) => f,
+                            Err(_) => continue,
+                        };
+                        let mut buf = vec![0u8; 64 * 1024];
+                        loop {
+                            let read = file.read(&mut buf).await?;
+                            if read == 0 { break; }
+                            stream.write_all(&buf[..read]).await?;
+                        }
+                    }
+                }
+                write_packet(&mut stream, PacketType::DirEnd, 0, &[]).await?;
+            } else {
+                let path = PathBuf::from(entry.path.clone());
+                let metadata = match fs::metadata(&path).await {
+                    Ok(metadata) => metadata,
+                    Err(_) => {
+                        let msg = format!("Source file missing: {}", entry.name);
+                        write_packet(&mut stream, PacketType::Error, 0, msg.as_bytes()).await?;
+                        continue;
+                    }
+                };
+                let size = metadata.len();
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(entry.modified);
+
+                if size != entry.size || modified != entry.modified {
+                    let msg = format!("Source file changed: {}", entry.name);
                     write_packet(&mut stream, PacketType::Error, 0, msg.as_bytes()).await?;
                     continue;
                 }
-            };
-            let size = metadata.len();
-            let modified = metadata
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(entry.modified);
 
-            if size != entry.size || modified != entry.modified {
-                let msg = format!("Source file changed: {}", entry.name);
-                write_packet(&mut stream, PacketType::Error, 0, msg.as_bytes()).await?;
-                continue;
-            }
+                let mut meta_payload = Vec::new();
+                meta_payload.extend_from_slice(&(entry.name.len() as u16).to_be_bytes());
+                meta_payload.extend_from_slice(entry.name.as_bytes());
+                meta_payload.extend_from_slice(&size.to_be_bytes());
+                meta_payload.extend_from_slice(&0u64.to_be_bytes()); // offset
+                meta_payload.extend_from_slice(&modified.to_be_bytes());
 
-            let offset = 0u64;
-            let mut meta_payload = Vec::new();
-            meta_payload.extend_from_slice(&(entry.name.len() as u16).to_be_bytes());
-            meta_payload.extend_from_slice(entry.name.as_bytes());
-            meta_payload.extend_from_slice(&size.to_be_bytes());
-            meta_payload.extend_from_slice(&offset.to_be_bytes());
-            meta_payload.extend_from_slice(&modified.to_be_bytes());
-            write_packet(&mut stream, PacketType::PullStream, 0, &meta_payload).await?;
+                if size <= INLINE_FILE_LIMIT {
+                    let file_bytes = match fs::read(&path).await {
+                        Ok(b) => b,
+                        Err(_) => {
+                            let msg = format!("Failed to read: {}", entry.name);
+                            write_packet(&mut stream, PacketType::Error, 0, msg.as_bytes()).await?;
+                            continue;
+                        }
+                    };
+                    let crc = crc32_of(&file_bytes);
+                    meta_payload.extend_from_slice(&file_bytes);
+                    meta_payload.extend_from_slice(&crc.to_be_bytes());
+                    write_packet(&mut stream, PacketType::PullInline, 0, &meta_payload).await?;
+                } else {
+                    let crc = match crc32_of_file(&path).await {
+                        Ok(c) => c,
+                        Err(_) => {
+                            let msg = format!("Failed to checksum: {}", entry.name);
+                            write_packet(&mut stream, PacketType::Error, 0, msg.as_bytes()).await?;
+                            continue;
+                        }
+                    };
+                    meta_payload.extend_from_slice(&crc.to_be_bytes());
+                    write_packet(&mut stream, PacketType::PullStream, 0, &meta_payload).await?;
 
-            let mut file = match File::open(&path).await {
-                Ok(file) => file,
-                Err(_) => {
-                    let msg = format!("Failed to open source file: {}", entry.name);
-                    write_packet(&mut stream, PacketType::Error, 0, msg.as_bytes()).await?;
-                    continue;
+                    let mut file = match File::open(&path).await {
+                        Ok(file) => file,
+                        Err(_) => {
+                            let msg = format!("Failed to open source file: {}", entry.name);
+                            write_packet(&mut stream, PacketType::Error, 0, msg.as_bytes()).await?;
+                            continue;
+                        }
+                    };
+                    let mut buf = vec![0u8; 64 * 1024];
+                    loop {
+                        let read = file.read(&mut buf).await?;
+                        if read == 0 { break; }
+                        stream.write_all(&buf[..read]).await?;
+                    }
                 }
-            };
-            if offset > 0 {
-                file.seek(std::io::SeekFrom::Start(offset)).await?;
             }
-            let mut buf = vec![0u8; 64 * 1024];
-            loop {
-                let read = file.read(&mut buf).await?;
-                if read == 0 {
-                    break;
-                }
-                stream.write_all(&buf[..read]).await?;
-            }
+        } else if packet_type == PacketType::DirListRequest as u16 {
+            let mut payload = vec![0u8; len as usize];
+            stream.read_exact(&mut payload).await?;
+            let id = String::from_utf8_lossy(&payload).to_string();
+            let entry = shared.get(&id).await;
+            let file_list: Vec<String> = if let Some(entry) = entry {
+                if entry.is_dir {
+                    let dir_path = PathBuf::from(&entry.path);
+                    let base = dir_path.parent().unwrap_or(&dir_path).to_path_buf();
+                    let mut queue = VecDeque::new();
+                    let _ = collect_files(&dir_path, &mut queue);
+                    queue.iter().map(|f| {
+                        f.path.strip_prefix(&base)
+                            .unwrap_or(&f.path)
+                            .to_string_lossy()
+                            .replace('\\', "/")
+                    }).collect()
+                } else { vec![] }
+            } else { vec![] };
+            let json = serde_json::to_vec(&file_list).unwrap_or_default();
+            write_packet(&mut stream, PacketType::DirListResponse, 0, &json).await?;
         } else if packet_type == PacketType::Goodbye as u16 {
             break;
         } else {
@@ -324,16 +451,37 @@ pub async fn add_shared(handle: &TransportHandle, paths: Vec<String>) -> Result<
     let mut new_entries = Vec::new();
     for input in paths {
         let path = PathBuf::from(&input);
-        if fs::metadata(&path).await.map(|m| m.is_dir()).unwrap_or(false) {
-            let mut queue = VecDeque::new();
-            collect_files(&path, &mut queue)?;
-            while let Some(entry) = queue.pop_front() {
-                let shared = build_shared_entry(&entry.path, entry.size).await?;
-                handle.shared.insert(shared.clone()).await;
-                new_entries.push(shared);
-            }
+        let meta = fs::metadata(&path).await?;
+        if meta.is_dir() {
+            // Create a single directory entry representing the whole folder tree.
+            // All files inside are encoded with their relative path so the
+            // receiver can reconstruct the full directory structure.
+            let dir_name = path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.display().to_string());
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            // Compute total size of all files inside.
+            let total_size = dir_total_size(&path)?;
+            let id = format!("dir:{}:{}", path.display(), modified);
+            let shared = SharedEntry {
+                id,
+                name: dir_name.clone(),
+                path: path.display().to_string(),
+                size: total_size,
+                modified,
+                relative_path: dir_name,
+                is_dir: true,
+            };
+            handle.shared.insert(shared.clone()).await;
+            new_entries.push(shared);
         } else {
-            let size = fs::metadata(&path).await?.len();
+            let size = meta.len();
             let shared = build_shared_entry(&path, size).await?;
             handle.shared.insert(shared.clone()).await;
             new_entries.push(shared);
@@ -342,13 +490,71 @@ pub async fn add_shared(handle: &TransportHandle, paths: Vec<String>) -> Result<
     Ok(new_entries)
 }
 
+fn dir_total_size(path: &Path) -> Result<u64> {
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let meta = std::fs::metadata(entry.path())?;
+        if meta.is_dir() {
+            total += dir_total_size(&entry.path())?;
+        } else {
+            total += meta.len();
+        }
+    }
+    Ok(total)
+}
+
 pub async fn list_shared(handle: &TransportHandle) -> Result<Vec<SharedEntry>> {
     Ok(handle.shared.list().await)
+}
+
+/// For a directory entry, return all file relative paths (forward-slash, no leading slash).
+/// e.g. ["MyFolder/sub/file.txt", "MyFolder/file2.txt"]
+pub async fn list_dir_files(handle: &TransportHandle, entry_id: String) -> Result<Vec<String>> {
+    let entry = handle.shared.get(&entry_id).await
+        .ok_or_else(|| anyhow!("Entry not found: {}", entry_id))?;
+    if !entry.is_dir {
+        return Ok(vec![]);
+    }
+    let dir_path = PathBuf::from(&entry.path);
+    let base = dir_path.parent().unwrap_or(&dir_path).to_path_buf();
+    let mut queue = VecDeque::new();
+    collect_files(&dir_path, &mut queue)?;
+    let mut result = Vec::new();
+    for file in queue {
+        let rel = file.path.strip_prefix(&base)
+            .unwrap_or(&file.path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        result.push(rel);
+    }
+    Ok(result)
 }
 
 pub async fn clear_shared(handle: &TransportHandle) -> Result<()> {
     handle.shared.clear().await;
     Ok(())
+}
+
+pub async fn fetch_remote_dir_files(
+    handle: &TransportHandle,
+    entry_id: String,
+    target_ip: String,
+    target_port: u16,
+) -> Result<Vec<String>> {
+    let addr = format!("{}:{}", target_ip, target_port);
+    let mut stream = handle
+        .outbound_pool
+        .get_or_connect(&addr, &addr)
+        .await?;
+    write_packet(&mut stream, PacketType::DirListRequest, 0, entry_id.as_bytes()).await?;
+    let (packet_type, payload) = read_packet(&mut stream).await?;
+    if packet_type != PacketType::DirListResponse as u16 {
+        return Err(anyhow!("Invalid dir list response"));
+    }
+    let list: Vec<String> = serde_json::from_slice(&payload)?;
+    handle.outbound_pool.insert(addr, stream).await;
+    Ok(list)
 }
 
 pub async fn fetch_remote_list(
@@ -396,15 +602,114 @@ pub async fn pull_file(
             let msg = String::from_utf8_lossy(&payload).to_string();
             return Err(anyhow!(msg));
         }
-        if packet_type != PacketType::PullStream as u16 {
-            return Err(anyhow!("Invalid pull response"));
+
+        // --- Directory pull (DirFileInline or DirFileStream packets until DirEnd) ---
+        if packet_type == PacketType::DirFileInline as u16
+            || packet_type == PacketType::DirFileStream as u16
+        {
+            let mut current_pt = packet_type;
+            let mut current_payload = payload;
+            let mut received_name = String::new();
+            loop {
+                if current_pt == PacketType::DirEnd as u16 {
+                    break;
+                }
+                let is_inline = current_pt == PacketType::DirFileInline as u16;
+                let is_stream = current_pt == PacketType::DirFileStream as u16;
+                if !is_inline && !is_stream {
+                    return Err(anyhow!("Unexpected packet in dir pull: {}", current_pt));
+                }
+                let (rel_path, size, offset, _modified, expected_crc) = parse_pull_meta(&current_payload)?;
+                let meta_end = 2 + rel_path.len() + 24;
+                let rel_path_local = rel_path.replace('/', std::path::MAIN_SEPARATOR_STR);
+                let mut target_path = PathBuf::from(&dest_dir);
+                target_path.push(&rel_path_local);
+                if let Some(parent) = target_path.parent() {
+                    fs::create_dir_all(parent).await.ok();
+                }
+                if received_name.is_empty() {
+                    received_name = rel_path.split('/').next().unwrap_or(&rel_path).to_string();
+                }
+                if is_inline {
+                    // Content is in the payload after the meta; CRC is appended at the very end
+                    let content_end = current_payload.len().saturating_sub(4);
+                    let file_bytes = &current_payload[meta_end..content_end];
+                    let expected_crc = u32::from_be_bytes([
+                        current_payload[content_end],
+                        current_payload[content_end + 1],
+                        current_payload[content_end + 2],
+                        current_payload[content_end + 3],
+                    ]);
+                    let actual_crc = crc32_of(file_bytes);
+                    if actual_crc != expected_crc {
+                        return Err(anyhow!("CRC32 mismatch for {}", rel_path));
+                    }
+                    if let Some(parent) = target_path.parent() {
+                        fs::create_dir_all(parent).await.ok();
+                    }
+                    fs::write(&target_path, file_bytes).await?;
+                    on_progress(PullProgress {
+                        entry_id: entry_id.clone(),
+                        name: rel_path.clone(),
+                        received_bytes: size,
+                        total_bytes: size,
+                    });
+                } else {
+                    receive_streamed_file(&mut stream, target_path, size, offset, expected_crc, max_mbps, |received| {
+                        on_progress(PullProgress {
+                            entry_id: entry_id.clone(),
+                            name: rel_path.clone(),
+                            received_bytes: received,
+                            total_bytes: size,
+                        });
+                    })
+                    .await?;
+                }
+                let (next_pt, next_payload) = read_packet(&mut stream).await?;
+                current_pt = next_pt;
+                current_payload = next_payload;
+            }
+            handle.outbound_pool.insert(addr, stream).await;
+            return Ok(received_name);
         }
 
-        let (name, size, offset, _modified) = parse_pull_meta(&payload)?;
+        // --- Single file pull ---
+        let is_inline = packet_type == PacketType::PullInline as u16;
+        let is_stream = packet_type == PacketType::PullStream as u16;
+        if !is_inline && !is_stream {
+            return Err(anyhow!("Invalid pull response: {}", packet_type));
+        }
+
+        let (name, size, offset, _modified, expected_crc) = parse_pull_meta(&payload)?;
+        let meta_end = 2 + name.len() + 24;
         let mut target_path = PathBuf::from(&dest_dir);
         target_path.push(name.clone());
 
-        let result = receive_streamed_file(&mut stream, target_path, size, offset, max_mbps, |received| {
+        if is_inline {
+            let content_end = payload.len().saturating_sub(4);
+            let file_bytes = &payload[meta_end..content_end];
+            let expected_crc = u32::from_be_bytes([
+                payload[content_end],
+                payload[content_end + 1],
+                payload[content_end + 2],
+                payload[content_end + 3],
+            ]);
+            let actual_crc = crc32_of(file_bytes);
+            if actual_crc != expected_crc {
+                return Err(anyhow!("CRC32 mismatch for {}", name));
+            }
+            fs::write(&target_path, file_bytes).await?;
+            on_progress(PullProgress {
+                entry_id: entry_id.clone(),
+                name: name.clone(),
+                received_bytes: size,
+                total_bytes: size,
+            });
+            handle.outbound_pool.insert(addr, stream).await;
+            return Ok(name);
+        }
+
+        let result = receive_streamed_file(&mut stream, target_path, size, offset, expected_crc, max_mbps, |received| {
             on_progress(PullProgress {
                 entry_id: entry_id.clone(),
                 name: name.clone(),
@@ -446,10 +751,12 @@ async fn build_shared_entry(path: &Path, size: u64) -> Result<SharedEntry> {
     let id = format!("{}:{}", path.display(), modified);
     Ok(SharedEntry {
         id,
+        relative_path: name.clone(),
         name,
         path: path.display().to_string(),
         size,
         modified,
+        is_dir: false,
     })
 }
 
@@ -485,12 +792,12 @@ fn parse_meta(payload: &[u8]) -> Result<(String, u64, u64)> {
     Ok((name, size, offset))
 }
 
-fn parse_pull_meta(payload: &[u8]) -> Result<(String, u64, u64, u64)> {
+fn parse_pull_meta(payload: &[u8]) -> Result<(String, u64, u64, u64, u32)> {
     if payload.len() < 2 {
         return Err(anyhow!("Invalid meta payload"));
     }
     let name_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
-    if payload.len() < 2 + name_len + 24 {
+    if payload.len() < 2 + name_len + 28 {
         return Err(anyhow!("Invalid meta payload size"));
     }
     let name = String::from_utf8_lossy(&payload[2..2 + name_len]).to_string();
@@ -524,7 +831,13 @@ fn parse_pull_meta(payload: &[u8]) -> Result<(String, u64, u64, u64)> {
         payload[24 + name_len],
         payload[25 + name_len],
     ]);
-    Ok((name, size, offset, modified))
+    let crc32 = u32::from_be_bytes([
+        payload[26 + name_len],
+        payload[27 + name_len],
+        payload[28 + name_len],
+        payload[29 + name_len],
+    ]);
+    Ok((name, size, offset, modified, crc32))
 }
 
 async fn file_existing_len(path: &Path) -> u64 {
@@ -536,6 +849,7 @@ async fn receive_streamed_file(
     path: PathBuf,
     size: u64,
     offset: u64,
+    expected_crc: u32,
     max_mbps: u64,
     mut on_progress: impl FnMut(u64),
 ) -> Result<()> {
@@ -560,17 +874,33 @@ async fn receive_streamed_file(
     let mut received = offset;
     let mut buf = vec![0u8; 64 * 1024];
     let throttle = Throttle::new(max_mbps);
+    let mut hasher = Crc32Hasher::new();
     while remaining > 0 {
         let read_len = buf.len().min(remaining as usize);
         let read = stream.read(&mut buf[..read_len]).await?;
         if read == 0 {
             break;
         }
+        hasher.update(&buf[..read]);
         file.write_all(&buf[..read]).await?;
         received += read as u64;
         on_progress(received);
         remaining -= read as u64;
         throttle.throttle(read as u64).await;
+    }
+    file.flush().await?;
+    drop(file);
+
+    // Verify CRC32 (skip if expected_crc == 0, used for push-mode transfers)
+    if expected_crc != 0 {
+        let actual_crc = hasher.finalize();
+        if actual_crc != expected_crc {
+            let _ = fs::remove_file(&path).await;
+            return Err(anyhow!(
+                "CRC32 mismatch for {}: expected {:08x}, got {:08x}",
+                path.display(), expected_crc, actual_crc
+            ));
+        }
     }
     Ok(())
 }
@@ -780,6 +1110,24 @@ impl Throttle {
             sleep(Duration::from_millis(ms)).await;
         }
     }
+}
+
+fn crc32_of(data: &[u8]) -> u32 {
+    let mut h = Crc32Hasher::new();
+    h.update(data);
+    h.finalize()
+}
+
+async fn crc32_of_file(path: &Path) -> Result<u32> {
+    let mut file = File::open(path).await?;
+    let mut h = Crc32Hasher::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 { break; }
+        h.update(&buf[..n]);
+    }
+    Ok(h.finalize())
 }
 
 async fn write_packet(

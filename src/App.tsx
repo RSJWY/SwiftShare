@@ -22,6 +22,8 @@ type SharedEntry = {
   path: string;
   size: number;
   modified: number;
+  relative_path: string;
+  is_dir: boolean;
 };
 
 type PullProgress = {
@@ -47,6 +49,19 @@ const DEFAULT_SETTINGS: Settings = {
   sameSubnetOnly: false,
 };
 
+// Format file size to human-readable format
+function formatFileSize(bytes: number): string {
+  if (bytes === 0) return "0 B";
+  const k = 1024;
+  const sizes = ["B", "KB", "MB", "GB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  const value = bytes / Math.pow(k, i);
+
+  // For sizes < 1 MB, show 0 decimals; for >= 1 MB, show 2 decimals
+  const decimals = i < 2 ? 0 : 2;
+  return value.toFixed(decimals) + " " + sizes[i];
+}
+
 const SETTINGS_STORE_PATH = "settings.json";
 
 function App() {
@@ -67,56 +82,86 @@ function App() {
   const [dropZoneActive, setDropZoneActive] = useState(false);
   const [localMachineId, setLocalMachineId] = useState<string>("");
   const [localPort, setLocalPort] = useState<number>(0);
-  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
+  // Current browse path for local shared list and remote list (array of folder names)
+  const [localBrowsePath, setLocalBrowsePath] = useState<string[]>([]);
+  const [remoteBrowsePath, setRemoteBrowsePath] = useState<string[]>([]);
   const dropInProgressRef = useRef(false);
+  // Resizable panel state
+  const [bottomHeight, setBottomHeight] = useState(224);
+  const [leftColWidth, setLeftColWidth] = useState(280);
+  const [rightColWidth, setRightColWidth] = useState(260);
 
-  // Group shared files by parent directory
-  const groupedSharedFiles = (() => {
-    const groups: { folder: string; files: SharedEntry[] }[] = [];
-    const folderMap = new Map<string, SharedEntry[]>();
-    const standalone: SharedEntry[] = [];
+  // Build a virtual tree node list for browsing.
+  // Returns { name, isDir, entry? } for each visible item at the given path.
+  type TreeNode = {
+    name: string;
+    isDir: boolean;
+    entry: SharedEntry | null; // null for virtual sub-folders
+    size: number;
+    childCount: number;
+  };
 
-    for (const entry of sharedList) {
-      const sep = entry.path.includes("/") ? "/" : "\\";
-      const parts = entry.path.split(sep);
-      if (parts.length > 1) {
-        const folder = parts.slice(0, -1).join(sep);
-        if (!folderMap.has(folder)) folderMap.set(folder, []);
-        folderMap.get(folder)!.push(entry);
-      } else {
-        standalone.push(entry);
+  function buildTreeNodes(list: SharedEntry[], browsePath: string[]): TreeNode[] {
+    const nodes = new Map<string, TreeNode>();
+
+    if (browsePath.length === 0) {
+      // Root level: return all top-level entries directly
+      for (const entry of list) {
+        const childCount = entry.is_dir
+          ? (dirFilesRef.current.get(entry.id) ?? []).length
+          : 0;
+        nodes.set(entry.name, {
+          name: entry.name,
+          isDir: entry.is_dir,
+          entry,
+          size: entry.size,
+          childCount,
+        });
       }
+      return Array.from(nodes.values()).sort((a, b) => {
+        if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      });
     }
 
-    // Group folders that share a common parent (i.e., came from a drag-in folder)
-    const merged = new Map<string, SharedEntry[]>();
+    // Inside a directory: find the root dir entry
+    const rootName = browsePath[0];
+    const dirEntry = list.find((e) => e.is_dir && e.name === rootName);
+    if (!dirEntry) return [];
 
-    for (const [folder, files] of folderMap) {
-      // Find if this folder is under another already-known folder
-      let parentKey: string | null = null;
-      for (const existing of merged.keys()) {
-        if (folder.startsWith(existing + "\\") || folder.startsWith(existing + "/")) {
-          parentKey = existing;
-          break;
+    // files contains paths like "MyFolder/sub/file.txt"
+    // browsePath = ["MyFolder", "sub"] → fullPrefix = "MyFolder/sub/"
+    const files = dirFilesRef.current.get(dirEntry.id) ?? [];
+    const fullPrefix = browsePath.join("/") + "/";
+
+    for (const rel of files) {
+      if (!rel.startsWith(fullPrefix)) continue;
+      const rest = rel.slice(fullPrefix.length);
+      if (!rest) continue;
+      const slashIdx = rest.indexOf("/");
+      if (slashIdx === -1) {
+        // Direct file child
+        if (!nodes.has(rest)) {
+          nodes.set(rest, { name: rest, isDir: false, entry: dirEntry, size: 0, childCount: 0 });
         }
-      }
-      if (parentKey) {
-        merged.get(parentKey)!.push(...files);
       } else {
-        merged.set(folder, [...files]);
+        // Sub-folder
+        const subFolder = rest.slice(0, slashIdx);
+        if (!nodes.has(subFolder)) {
+          nodes.set(subFolder, { name: subFolder, isDir: true, entry: dirEntry, size: 0, childCount: 0 });
+        }
+        nodes.get(subFolder)!.childCount++;
       }
     }
+    return Array.from(nodes.values()).sort((a, b) => {
+      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+  }
 
-    for (const [folder, files] of merged) {
-      groups.push({ folder, files });
-    }
-
-    if (standalone.length > 0) {
-      groups.unshift({ folder: "", files: standalone });
-    }
-
-    return groups;
-  })();
+  // dirFilesRef: maps dir entry id -> array of relative file paths (forward-slash, no leading slash)
+  // e.g. ["MyFolder/sub/file.txt", "MyFolder/file2.txt"]
+  const dirFilesRef = useRef<Map<string, string[]>>(new Map());
 
   useEffect(() => {
     invoke<string>("get_local_machine_id_command")
@@ -203,10 +248,29 @@ function App() {
 
   useEffect(() => {
     if (!activeDevice) return;
+    setRemoteBrowsePath([]);
     invoke<SharedEntry[]>("fetch_remote_list_command", {
       targetIp: activeDevice.ip,
       targetPort: activeDevice.port,
-    }).then((list) => setRemoteList(list ?? []));
+    }).then(async (list) => {
+      const entries = list ?? [];
+      setRemoteList(entries);
+      // Pre-fetch file trees for remote directory entries so we can browse them
+      for (const entry of entries) {
+        if (entry.is_dir) {
+          try {
+            const files = await invoke<string[]>("fetch_remote_dir_files_command", {
+              entryId: entry.id,
+              targetIp: activeDevice.ip,
+              targetPort: activeDevice.port,
+            });
+            dirFilesRef.current.set(entry.id, files);
+          } catch {
+            // ignore
+          }
+        }
+      }
+    });
   }, [activeDevice]);
 
   const addSharedFiles = async (paths: string[]) => {
@@ -214,7 +278,19 @@ function App() {
     try {
       await invoke<SharedEntry[]>("add_shared_command", { paths });
       const updated = await invoke<SharedEntry[]>("list_shared_command");
-      setSharedList(updated ?? []);
+      const entries = updated ?? [];
+      setSharedList(entries);
+      // Pre-fetch file trees for local directory entries
+      for (const entry of entries) {
+        if (entry.is_dir && !dirFilesRef.current.has(entry.id)) {
+          try {
+            const files = await invoke<string[]>("list_dir_files_command", { entryId: entry.id });
+            dirFilesRef.current.set(entry.id, files);
+          } catch {
+            // ignore
+          }
+        }
+      }
       setStatusType("success");
       setStatusMessage(`已添加 ${paths.length} 个文件`);
     } catch (error) {
@@ -284,38 +360,6 @@ function App() {
       discoveryIntervalMs: DEFAULT_SETTINGS.discoveryIntervalMs,
       sameSubnetOnly: DEFAULT_SETTINGS.sameSubnetOnly,
     });
-  };
-
-  const pullEntry = async (entry: SharedEntry) => {
-    if (!activeDevice || !downloadDir) return;
-    setPullingId(entry.id);
-    setProgress(0);
-    setStatusType("info");
-    setStatusMessage(`正在拉取 ${entry.name}...`);
-    setPullProgress(null);
-    try {
-      await invoke("pull_file_command", {
-        entryId: entry.id,
-        targetIp: activeDevice.ip,
-        targetPort: activeDevice.port,
-        destDir: downloadDir,
-      });
-      setStatusType("success");
-      setStatusMessage(`已完成 ${entry.name}`);
-      setPullProgress(null);
-      const list = await invoke<SharedEntry[]>("fetch_remote_list_command", {
-        targetIp: activeDevice.ip,
-        targetPort: activeDevice.port,
-      });
-      setRemoteList(list ?? []);
-    } catch (error) {
-      console.error(error);
-      setStatusType("error");
-      setStatusMessage(`拉取失败: ${String(error)}`);
-      setPullProgress(null);
-    } finally {
-      setPullingId(null);
-    }
   };
 
   const dragRemoteEntry = async (entry: SharedEntry) => {
@@ -411,6 +455,8 @@ return (
                     onClick={async () => {
                       await invoke("clear_shared_command");
                       setSharedList([]);
+                      setLocalBrowsePath([]);
+                      dirFilesRef.current.clear();
                     }}
                   >
                     清空
@@ -436,63 +482,64 @@ return (
                   </div>
                 </div>
               ) : (
-                <div className="space-y-2">
-                  {groupedSharedFiles.map((group) => {
-                    const folderName = group.folder
-                      ? group.folder.split(/[\\/]/).pop() || group.folder
-                      : "";
-                    const totalSize = group.files.reduce((s, f) => s + f.size, 0);
-                    const isExpanded = !expandedFolders.has(group.folder);
-
-                    return (
-                      <div key={group.folder || "__standalone__"}>
-                        {/* Folder header (only for actual folders) */}
-                        {group.folder && (
+                <div className="space-y-1">
+                  {/* Breadcrumb */}
+                  {localBrowsePath.length > 0 && (
+                    <div className="flex items-center gap-1 px-1 pb-2 text-[10px] text-white/40">
+                      <button className="hover:text-white/70" onClick={() => setLocalBrowsePath([])}>
+                        共享根目录
+                      </button>
+                      {localBrowsePath.map((seg, i) => (
+                        <span key={i} className="flex items-center gap-1">
+                          <span>/</span>
                           <button
-                            className="flex w-full items-center gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-left transition hover:bg-white/10"
-                            onClick={() => setExpandedFolders((prev) => {
-                              const next = new Set(prev);
-                              if (next.has(group.folder)) next.delete(group.folder);
-                              else next.add(group.folder);
-                              return next;
-                            })}
+                            className="hover:text-white/70"
+                            onClick={() => setLocalBrowsePath(localBrowsePath.slice(0, i + 1))}
                           >
-                            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-amber-500/20">
-                              <svg className="h-4 w-4 text-amber-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
-                              </svg>
-                            </div>
-                            <div className="min-w-0 flex-1">
-                              <p className="truncate text-sm font-medium text-white">{folderName}</p>
-                              <p className="text-[10px] text-white/40">
-                                {group.files.length} 个文件 · {(totalSize / 1024 / 1024).toFixed(2)} MB
-                              </p>
-                            </div>
-                            <svg
-                              className={`h-4 w-4 text-white/40 transition-transform ${isExpanded ? "rotate-90" : ""}`}
-                              fill="none" viewBox="0 0 24 24" stroke="currentColor"
-                            >
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-                            </svg>
+                            {seg}
                           </button>
-                        )}
-
-                        {/* File items */}
-                        {isExpanded && (
-                          <div className="space-y-1 mt-2">
-                            {group.files.map((entry) => (
-                              <div
-                                key={entry.id}
-                                className="p-2 bg-white/10 rounded text-white text-sm"
-                              >
-                                {entry.name}
-                              </div>
-                            ))}
-                          </div>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  {buildTreeNodes(sharedList, localBrowsePath).map((node) => (
+                    <div
+                      key={node.name}
+                      className={`flex items-center gap-2 rounded-lg px-2 py-2 transition ${
+                        node.isDir ? "hover:bg-white/8 cursor-pointer" : "hover:bg-white/5"
+                      }`}
+                      onClick={() => {
+                        if (node.isDir) setLocalBrowsePath([...localBrowsePath, node.name]);
+                      }}
+                    >
+                      <div className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-lg ${
+                        node.isDir ? "bg-amber-500/20" : "bg-white/10"
+                      }`}>
+                        {node.isDir ? (
+                          <svg className="h-4 w-4 text-amber-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+                          </svg>
+                        ) : (
+                          <svg className="h-3.5 w-3.5 text-white/50" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                          </svg>
                         )}
                       </div>
-                    );
-                  })}
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-xs text-white/80">{node.name}</p>
+                        <p className="text-[10px] text-white/40">
+                          {node.isDir
+                            ? `${node.childCount} 项`
+                            : formatFileSize(node.size)}
+                        </p>
+                      </div>
+                      {node.isDir && (
+                        <svg className="h-3.5 w-3.5 shrink-0 text-white/30" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                        </svg>
+                      )}
+                    </div>
+                  ))}
                 </div>
               )}
             </div>
@@ -513,7 +560,31 @@ return (
           </div>
 
           {/* Bottom Area: Devices + Remote List + Progress */}
-          <div className="grid grid-cols-[280px_1fr_260px] gap-4 h-56">
+          {/* Horizontal resize handle */}
+          <div
+            className="flex h-2 cursor-row-resize items-center justify-center group shrink-0"
+            onMouseDown={(e) => {
+              e.preventDefault();
+              const startY = e.clientY;
+              const startH = bottomHeight;
+              const onMove = (ev: MouseEvent) => {
+                const delta = startY - ev.clientY;
+                setBottomHeight(Math.max(160, Math.min(480, startH + delta)));
+              };
+              const onUp = () => {
+                window.removeEventListener('mousemove', onMove);
+                window.removeEventListener('mouseup', onUp);
+              };
+              window.addEventListener('mousemove', onMove);
+              window.addEventListener('mouseup', onUp);
+            }}
+          >
+            <div className="h-0.5 w-12 rounded-full bg-white/20 transition group-hover:bg-white/50" />
+          </div>
+          <div
+            className="grid gap-0 shrink-0"
+            style={{ height: bottomHeight, gridTemplateColumns: `${leftColWidth}px 6px 1fr 6px ${rightColWidth}px` }}
+          >
             {/* Left: Device List (Compact) */}
             <div className="flex flex-col overflow-hidden rounded-xl border border-white/10 bg-white/5">
               <div className="flex items-center justify-between border-b border-white/10 px-3 py-2">
@@ -592,6 +663,27 @@ return (
               </div>
             </div>
 
+            {/* Vertical resize handle: left | middle */}
+            <div
+              className="flex cursor-col-resize items-center justify-center group"
+              onMouseDown={(e) => {
+                e.preventDefault();
+                const startX = e.clientX;
+                const startW = leftColWidth;
+                const onMove = (ev: MouseEvent) => {
+                  setLeftColWidth(Math.max(160, Math.min(400, startW + ev.clientX - startX)));
+                };
+                const onUp = () => {
+                  window.removeEventListener('mousemove', onMove);
+                  window.removeEventListener('mouseup', onUp);
+                };
+                window.addEventListener('mousemove', onMove);
+                window.addEventListener('mouseup', onUp);
+              }}
+            >
+              <div className="h-12 w-0.5 rounded-full bg-white/20 transition group-hover:bg-white/50" />
+            </div>
+
             {/* Middle: Remote Shared List */}
             <div className="flex flex-col overflow-hidden rounded-xl border border-white/10 bg-white/5">
               <div className="flex items-center justify-between border-b border-white/10 px-3 py-2">
@@ -601,12 +693,28 @@ return (
                 {activeDevice && (
                   <button
                     className="subtle-button py-1 px-2 text-[10px]"
-                    onClick={() =>
-                      invoke<SharedEntry[]>("fetch_remote_list_command", {
+                    onClick={async () => {
+                      if (!activeDevice) return;
+                      setRemoteBrowsePath([]);
+                      const list = await invoke<SharedEntry[]>("fetch_remote_list_command", {
                         targetIp: activeDevice.ip,
                         targetPort: activeDevice.port,
-                      }).then((list) => setRemoteList(list ?? []))
-                    }
+                      });
+                      const entries = list ?? [];
+                      setRemoteList(entries);
+                      for (const entry of entries) {
+                        if (entry.is_dir) {
+                          try {
+                            const files = await invoke<string[]>("fetch_remote_dir_files_command", {
+                              entryId: entry.id,
+                              targetIp: activeDevice.ip,
+                              targetPort: activeDevice.port,
+                            });
+                            dirFilesRef.current.set(entry.id, files);
+                          } catch { /* ignore */ }
+                        }
+                      }
+                    }}
                   >
                     刷新
                   </button>
@@ -623,45 +731,181 @@ return (
                   </div>
                 ) : (
                   <div className="space-y-1">
-                    {remoteList.map((entry) => (
+                    {/* Remote Breadcrumb */}
+                    {remoteBrowsePath.length > 0 && (
+                      <div className="flex items-center gap-1 px-1 pb-2 text-[10px] text-white/40">
+                        <button className="hover:text-white/70" onClick={() => setRemoteBrowsePath([])}>
+                          根目录
+                        </button>
+                        {remoteBrowsePath.map((seg, i) => (
+                          <span key={i} className="flex items-center gap-1">
+                            <span>/</span>
+                            <button
+                              className="hover:text-white/70"
+                              onClick={() => setRemoteBrowsePath(remoteBrowsePath.slice(0, i + 1))}
+                            >
+                              {seg}
+                            </button>
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    {buildTreeNodes(remoteList, remoteBrowsePath).map((node) => (
                       <div
-                        key={entry.id}
+                        key={node.name}
                         className="flex items-center gap-2 rounded-lg bg-white/5 px-2 py-2 hover:bg-white/10"
                       >
-                        <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded bg-indigo-500/20">
-                          <svg className="h-3 w-3 text-indigo-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                          </svg>
+                        <div className={`flex h-6 w-6 shrink-0 items-center justify-center rounded ${
+                          node.isDir ? "bg-amber-500/20" : "bg-indigo-500/20"
+                        }`}>
+                          {node.isDir ? (
+                            <svg className="h-3.5 w-3.5 text-amber-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+                            </svg>
+                          ) : (
+                            <svg className="h-3 w-3 text-indigo-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                            </svg>
+                          )}
                         </div>
                         <div className="min-w-0 flex-1">
-                          <p className="truncate text-xs text-white/80">{entry.name}</p>
-                          <p className="text-[10px] text-white/40">{(entry.size / 1024 / 1024).toFixed(2)} MB</p>
+                          <p className="truncate text-xs text-white/80">{node.name}</p>
+                          <p className="text-[10px] text-white/40">
+                            {node.isDir ? `${node.childCount} 项` : formatFileSize(node.size)}
+                          </p>
                         </div>
-                        <div className="flex shrink-0 gap-1">
-                          <button
-                            className="rounded bg-indigo-500/80 px-2 py-1 text-[10px] text-white transition hover:bg-indigo-400 disabled:opacity-50"
-                            onClick={() => pullEntry(entry)}
-                            disabled={!downloadDir || pullingId === entry.id}
-                          >
-                            {pullingId === entry.id ? "..." : "拉取"}
-                          </button>
-                          <button
-                            className="rounded border border-white/10 bg-white/5 px-2 py-1 text-[10px] text-white/70 transition hover:bg-white/10"
-                            onMouseDown={(e) => {
-                              e.preventDefault();
-                              void dragRemoteEntry(entry);
-                            }}
-                            disabled={draggingId === entry.id || !activeDevice}
-                            title="拖出到文件夹"
-                          >
-                            {draggingId === entry.id ? "..." : "拖出"}
-                          </button>
-                        </div>
+                        {node.isDir ? (
+                          <div className="flex shrink-0 gap-1">
+                            <button
+                              className="shrink-0 rounded bg-indigo-500/80 px-2 py-1 text-[10px] text-white transition hover:bg-indigo-400 disabled:opacity-50"
+                              onClick={() => setRemoteBrowsePath([...remoteBrowsePath, node.name])}
+                            >
+                              进入
+                            </button>
+                            {remoteBrowsePath.length === 0 && node.entry && (
+                              <button
+                                className="shrink-0 rounded border border-white/10 bg-white/5 px-2 py-1 text-[10px] text-white/70 transition hover:bg-white/10 disabled:opacity-50"
+                                onClick={async () => {
+                                  let dir = downloadDir;
+                                  if (!dir) {
+                                    const folder = await open({ directory: true, multiple: false });
+                                    if (typeof folder !== "string") return;
+                                    setSettings(prev => ({ ...prev, downloadDir: folder }));
+                                    setDownloadDir(folder);
+                                    dir = folder;
+                                  }
+                                  if (node.entry) {
+                                    setPullingId(node.entry.id);
+                                    setProgress(0);
+                                    setStatusType("info");
+                                    setStatusMessage(`正在拉取 ${node.entry.name}...`);
+                                    setPullProgress(null);
+                                    try {
+                                      await invoke("pull_file_command", {
+                                        entryId: node.entry.id,
+                                        targetIp: activeDevice!.ip,
+                                        targetPort: activeDevice!.port,
+                                        destDir: dir,
+                                      });
+                                      setStatusType("success");
+                                      setStatusMessage(`已完成 ${node.entry.name}`);
+                                      setPullProgress(null);
+                                    } catch (error) {
+                                      setStatusType("error");
+                                      setStatusMessage(`拉取失败: ${String(error)}`);
+                                      setPullProgress(null);
+                                    } finally {
+                                      setPullingId(null);
+                                    }
+                                  }
+                                }}
+                                disabled={node.entry ? pullingId === node.entry.id : false}
+                              >
+                                {node.entry && pullingId === node.entry.id ? "..." : "拉取全部"}
+                              </button>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="flex shrink-0 gap-1">
+                            <button
+                              className="rounded bg-indigo-500/80 px-2 py-1 text-[10px] text-white transition hover:bg-indigo-400 disabled:opacity-50"
+                              onClick={async () => {
+                                let dir = downloadDir;
+                                if (!dir) {
+                                  const folder = await open({ directory: true, multiple: false });
+                                  if (typeof folder !== "string") return;
+                                  setSettings(prev => ({ ...prev, downloadDir: folder }));
+                                  setDownloadDir(folder);
+                                  dir = folder;
+                                }
+                                if (node.entry) {
+                                  setPullingId(node.entry.id);
+                                  setProgress(0);
+                                  setStatusType("info");
+                                  setStatusMessage(`正在拉取 ${node.entry.name}...`);
+                                  setPullProgress(null);
+                                  try {
+                                    await invoke("pull_file_command", {
+                                      entryId: node.entry.id,
+                                      targetIp: activeDevice!.ip,
+                                      targetPort: activeDevice!.port,
+                                      destDir: dir,
+                                    });
+                                    setStatusType("success");
+                                    setStatusMessage(`已完成 ${node.entry.name}`);
+                                    setPullProgress(null);
+                                  } catch (error) {
+                                    setStatusType("error");
+                                    setStatusMessage(`拉取失败: ${String(error)}`);
+                                    setPullProgress(null);
+                                  } finally {
+                                    setPullingId(null);
+                                  }
+                                }
+                              }}
+                              disabled={node.entry ? pullingId === node.entry.id : false}
+                            >
+                              {node.entry && pullingId === node.entry.id ? "..." : "拉取"}
+                            </button>
+                            <button
+                              className="rounded border border-white/10 bg-white/5 px-2 py-1 text-[10px] text-white/70 transition hover:bg-white/10"
+                              onMouseDown={(e) => {
+                                e.preventDefault();
+                                if (node.entry) void dragRemoteEntry(node.entry);
+                              }}
+                              disabled={node.entry ? draggingId === node.entry.id : true}
+                              title="拖出到文件夹"
+                            >
+                              {node.entry && draggingId === node.entry.id ? "..." : "拖出"}
+                            </button>
+                          </div>
+                        )}
                       </div>
                     ))}
                   </div>
                 )}
               </div>
+            </div>
+
+            {/* Vertical resize handle: middle | right */}
+            <div
+              className="flex cursor-col-resize items-center justify-center group"
+              onMouseDown={(e) => {
+                e.preventDefault();
+                const startX = e.clientX;
+                const startW = rightColWidth;
+                const onMove = (ev: MouseEvent) => {
+                  setRightColWidth(Math.max(180, Math.min(380, startW - (ev.clientX - startX))));
+                };
+                const onUp = () => {
+                  window.removeEventListener('mousemove', onMove);
+                  window.removeEventListener('mouseup', onUp);
+                };
+                window.addEventListener('mousemove', onMove);
+                window.addEventListener('mouseup', onUp);
+              }}
+            >
+              <div className="h-12 w-0.5 rounded-full bg-white/20 transition group-hover:bg-white/50" />
             </div>
 
             {/* Right: Transfer Progress (Simplified) */}
@@ -701,8 +945,8 @@ return (
                       />
                     </div>
                     <div className="text-[10px] text-white/40">
-                      {(pullProgress.received_bytes / 1024 / 1024).toFixed(2)} / {" "}
-                      {(pullProgress.total_bytes / 1024 / 1024).toFixed(2)} MB
+                      {formatFileSize(pullProgress.received_bytes)} / {" "}
+                      {formatFileSize(pullProgress.total_bytes)}
                     </div>
                   </div>
                 ) : (

@@ -3981,6 +3981,7 @@ name = "tauri-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "crc32fast",
  "if-addrs 0.10.2",
  "local-ip-address",
  "mdns-sd",

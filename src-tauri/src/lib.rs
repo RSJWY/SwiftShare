@@ -4,7 +4,7 @@ use anyhow::Result;
 use transport::{start_listener, start_transfer, TransportHandle};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, Semaphore};
-use transport::{add_shared, clear_shared, fetch_remote_list, list_shared, pull_file, SharedEntry};
+use transport::{add_shared, clear_shared, fetch_remote_dir_files, fetch_remote_list, list_shared, list_dir_files, pull_file, SharedEntry};
 use tauri::{Emitter, Manager, WindowEvent};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::fs;
@@ -47,6 +47,12 @@ async fn add_shared_command(paths: Vec<String>) -> Result<Vec<SharedEntry>, Stri
 }
 
 #[tauri::command]
+async fn list_dir_files_command(entry_id: String) -> Result<Vec<String>, String> {
+    let transport = wait_transport().await?;
+    list_dir_files(&transport, entry_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn list_shared_command() -> Result<Vec<SharedEntry>, String> {
     let transport = wait_transport().await?;
     list_shared(&transport).await.map_err(|e| e.to_string())
@@ -56,6 +62,14 @@ async fn list_shared_command() -> Result<Vec<SharedEntry>, String> {
 async fn clear_shared_command() -> Result<(), String> {
     let transport = wait_transport().await?;
     clear_shared(&transport).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn fetch_remote_dir_files_command(entry_id: String, target_ip: String, target_port: u16) -> Result<Vec<String>, String> {
+    let transport = wait_transport().await?;
+    fetch_remote_dir_files(&transport, entry_id, target_ip, target_port)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -273,8 +287,10 @@ pub fn run() {
             start_transfer_command,
             add_shared_command,
             list_shared_command,
+            list_dir_files_command,
             clear_shared_command,
             fetch_remote_list_command,
+            fetch_remote_dir_files_command,
             pull_file_command,
             pull_to_temp_command,
             get_local_machine_id_command,
