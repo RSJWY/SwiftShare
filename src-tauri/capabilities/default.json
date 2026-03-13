@@ -13,6 +13,7 @@
     "drag:default",
     "updater:default",
     "process:allow-restart",
+    "shell:allow-open",
     "dialog:allow-ask"
   ]
 }

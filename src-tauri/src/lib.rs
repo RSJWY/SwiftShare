@@ -8,6 +8,14 @@ use transport::{add_shared, clear_shared, check_pull_conflict, fetch_remote_dir_
 use tauri::{Emitter, Manager, WindowEvent};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::fs;
+#[cfg(windows)]
+use std::path::PathBuf;
+#[cfg(windows)]
+use winreg::enums::HKEY_CURRENT_USER;
+#[cfg(windows)]
+use winreg::enums::HKEY_LOCAL_MACHINE;
+#[cfg(windows)]
+use winreg::RegKey;
 
 /// Wait for TRANSPORT_HANDLE to be initialized (up to 5 seconds).
 /// All commands should call this instead of manually checking Option.
@@ -255,6 +263,54 @@ async fn update_settings_command(
     Ok(())
 }
 
+#[tauri::command]
+fn is_portable_mode_command(app: tauri::AppHandle) -> bool {
+    if std::env::var("SWIFTSHARE_PORTABLE").ok().as_deref() == Some("1") {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        let exe_path = match app.path().executable() {
+            Ok(path) => path,
+            Err(_) => return false,
+        };
+
+        let is_installed = |root: &RegKey| -> Option<bool> {
+            let uninstall = root
+                .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall")
+                .ok()?;
+
+            for key_name in uninstall.enum_keys().flatten() {
+                let subkey = uninstall.open_subkey(&key_name).ok()?;
+                let display_name: String = subkey.get_value("DisplayName").ok()?;
+                if display_name != "SwiftShare" {
+                    continue;
+                }
+                let install_location: String = subkey.get_value("InstallLocation").ok()?;
+                if install_location.is_empty() {
+                    return Some(false);
+                }
+                let install_path = PathBuf::from(install_location);
+                return Some(exe_path.starts_with(install_path));
+            }
+            None
+        };
+
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        if let Some(installed) = is_installed(&hkcu) {
+            return !installed;
+        }
+
+        let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+        if let Some(installed) = is_installed(&hklm) {
+            return !installed;
+        }
+    }
+
+    false
+}
+
 static TRANSPORT_HANDLE: std::sync::OnceLock<Arc<Mutex<Option<TransportHandle>>>> = std::sync::OnceLock::new();
 static SETTINGS_STATE: std::sync::OnceLock<Arc<SettingsState>> = std::sync::OnceLock::new();
 static DISCOVERY_HANDLE: std::sync::OnceLock<Arc<Mutex<Option<discovery::DiscoveryHandle>>>> = std::sync::OnceLock::new();
@@ -297,6 +353,7 @@ pub fn run() {
         .plugin(tauri_plugin_drag::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_shell::init())
         .setup(|app| {
             let handle = app.handle().clone();
             let cleanup_handle = app.handle().clone();
@@ -353,7 +410,8 @@ pub fn run() {
             get_local_port_command,
             notify_offline_command,
             refresh_discovery_command,
-            update_settings_command
+            update_settings_command,
+            is_portable_mode_command
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
