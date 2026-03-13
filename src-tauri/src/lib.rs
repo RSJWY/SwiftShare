@@ -4,7 +4,7 @@ use anyhow::Result;
 use transport::{start_listener, start_transfer, TransportHandle};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, Semaphore};
-use transport::{add_shared, clear_shared, fetch_remote_dir_files, fetch_remote_list, list_shared, list_dir_files, pull_file, SharedEntry};
+use transport::{add_shared, clear_shared, fetch_remote_dir_files, fetch_remote_list, list_shared, list_dir_files, pull_file, SharedEntry, DirFileInfo, CancelToken};
 use tauri::{Emitter, Manager, WindowEvent};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::fs;
@@ -47,7 +47,7 @@ async fn add_shared_command(paths: Vec<String>) -> Result<Vec<SharedEntry>, Stri
 }
 
 #[tauri::command]
-async fn list_dir_files_command(entry_id: String) -> Result<Vec<String>, String> {
+async fn list_dir_files_command(entry_id: String) -> Result<Vec<DirFileInfo>, String> {
     let transport = wait_transport().await?;
     list_dir_files(&transport, entry_id).await.map_err(|e| e.to_string())
 }
@@ -65,7 +65,7 @@ async fn clear_shared_command() -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn fetch_remote_dir_files_command(entry_id: String, target_ip: String, target_port: u16) -> Result<Vec<String>, String> {
+async fn fetch_remote_dir_files_command(entry_id: String, target_ip: String, target_port: u16) -> Result<Vec<DirFileInfo>, String> {
     let transport = wait_transport().await?;
     fetch_remote_dir_files(&transport, entry_id, target_ip, target_port)
         .await
@@ -95,12 +95,22 @@ async fn pull_file_command(
     let _permit = pull_limit.acquire().await.map_err(|e| e.to_string())?;
     let transport = wait_transport().await?;
     let max_mbps = settings.max_mbps.load(Ordering::Relaxed);
-    pull_file(&transport, entry_id, target_ip, target_port, dest_dir, max_mbps, |progress| {
+    let cancel = CancelToken::new();
+    {
+        let mut guard = get_pull_cancel().lock().await;
+        *guard = Some(cancel.clone());
+    }
+    let result = pull_file(&transport, entry_id, target_ip, target_port, dest_dir, max_mbps, cancel, |progress| {
         let _ = app.emit("pull-progress", progress.clone());
     })
     .await
     .map(|_| ())
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string());
+    {
+        let mut guard = get_pull_cancel().lock().await;
+        *guard = None;
+    }
+    result
 }
 
 #[tauri::command]
@@ -125,22 +135,41 @@ async fn pull_to_temp_command(
     let _permit = pull_limit.acquire().await.map_err(|e| e.to_string())?;
     let transport = wait_transport().await?;
     let max_mbps = settings.max_mbps.load(Ordering::Relaxed);
-    let pulled_name = pull_file(
+    let cancel = CancelToken::new();
+    {
+        let mut guard = get_pull_cancel().lock().await;
+        *guard = Some(cancel.clone());
+    }
+    let result = pull_file(
         &transport,
         entry_id.clone(),
         target_ip,
         target_port,
         cache_dir.to_string_lossy().to_string(),
         max_mbps,
+        cancel,
         |progress| {
         let _ = app.emit("pull-progress", progress.clone());
     },
     )
     .await
-    .map_err(|e| e.to_string())?;
-
+    .map_err(|e| e.to_string());
+    {
+        let mut guard = get_pull_cancel().lock().await;
+        *guard = None;
+    }
+    let pulled_name = result?;
     let resolved = cache_dir.join(pulled_name);
     Ok(resolved.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+async fn cancel_pull_command() -> Result<(), String> {
+    let guard = get_pull_cancel().lock().await;
+    if let Some(cancel) = guard.as_ref() {
+        cancel.cancel();
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -211,6 +240,11 @@ async fn update_settings_command(
 static TRANSPORT_HANDLE: std::sync::OnceLock<Arc<Mutex<Option<TransportHandle>>>> = std::sync::OnceLock::new();
 static SETTINGS_STATE: std::sync::OnceLock<Arc<SettingsState>> = std::sync::OnceLock::new();
 static DISCOVERY_HANDLE: std::sync::OnceLock<Arc<Mutex<Option<discovery::DiscoveryHandle>>>> = std::sync::OnceLock::new();
+static PULL_CANCEL: std::sync::OnceLock<Mutex<Option<CancelToken>>> = std::sync::OnceLock::new();
+
+fn get_pull_cancel() -> &'static Mutex<Option<CancelToken>> {
+    PULL_CANCEL.get_or_init(|| Mutex::new(None))
+}
 
 #[derive(Debug)]
 struct SettingsState {
@@ -293,6 +327,7 @@ pub fn run() {
             fetch_remote_dir_files_command,
             pull_file_command,
             pull_to_temp_command,
+            cancel_pull_command,
             get_local_machine_id_command,
             get_local_port_command,
             notify_offline_command,

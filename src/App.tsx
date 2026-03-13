@@ -31,6 +31,13 @@ type PullProgress = {
   name: string;
   received_bytes: number;
   total_bytes: number;
+  entry_received_bytes: number;
+  entry_total_bytes: number;
+};
+
+type DirFileInfo = {
+  path: string;
+  size: number;
 };
 
 type Settings = {
@@ -62,6 +69,14 @@ function formatFileSize(bytes: number): string {
   return value.toFixed(decimals) + " " + sizes[i];
 }
 
+// Format remaining time
+function formatEta(seconds: number): string {
+  if (seconds <= 0 || !isFinite(seconds)) return "";
+  if (seconds < 60) return `${Math.ceil(seconds)}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.ceil(seconds % 60)}s`;
+  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+}
+
 const SETTINGS_STORE_PATH = "settings.json";
 
 function App() {
@@ -75,6 +90,7 @@ function App() {
   const [statusType, setStatusType] = useState<"success" | "error" | "info">("info");
   const [pullingId, setPullingId] = useState<string | null>(null);
   const [pullProgress, setPullProgress] = useState<PullProgress | null>(null);
+  const speedRef = useRef<{ lastBytes: number; lastTime: number; speed: number }>({ lastBytes: 0, lastTime: 0, speed: 0 });
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
@@ -129,20 +145,20 @@ function App() {
     const dirEntry = list.find((e) => e.is_dir && e.name === rootName);
     if (!dirEntry) return [];
 
-    // files contains paths like "MyFolder/sub/file.txt"
+    // files contains {path, size} like {path: "MyFolder/sub/file.txt", size: 1234}
     // browsePath = ["MyFolder", "sub"] → fullPrefix = "MyFolder/sub/"
     const files = dirFilesRef.current.get(dirEntry.id) ?? [];
     const fullPrefix = browsePath.join("/") + "/";
 
-    for (const rel of files) {
-      if (!rel.startsWith(fullPrefix)) continue;
-      const rest = rel.slice(fullPrefix.length);
+    for (const fileInfo of files) {
+      if (!fileInfo.path.startsWith(fullPrefix)) continue;
+      const rest = fileInfo.path.slice(fullPrefix.length);
       if (!rest) continue;
       const slashIdx = rest.indexOf("/");
       if (slashIdx === -1) {
         // Direct file child
         if (!nodes.has(rest)) {
-          nodes.set(rest, { name: rest, isDir: false, entry: dirEntry, size: 0, childCount: 0 });
+          nodes.set(rest, { name: rest, isDir: false, entry: dirEntry, size: fileInfo.size, childCount: 0 });
         }
       } else {
         // Sub-folder
@@ -150,7 +166,9 @@ function App() {
         if (!nodes.has(subFolder)) {
           nodes.set(subFolder, { name: subFolder, isDir: true, entry: dirEntry, size: 0, childCount: 0 });
         }
-        nodes.get(subFolder)!.childCount++;
+        const node = nodes.get(subFolder)!;
+        node.childCount++;
+        node.size += fileInfo.size;
       }
     }
     return Array.from(nodes.values()).sort((a, b) => {
@@ -159,9 +177,8 @@ function App() {
     });
   }
 
-  // dirFilesRef: maps dir entry id -> array of relative file paths (forward-slash, no leading slash)
-  // e.g. ["MyFolder/sub/file.txt", "MyFolder/file2.txt"]
-  const dirFilesRef = useRef<Map<string, string[]>>(new Map());
+  // dirFilesRef: maps dir entry id -> array of file info (path + size)
+  const dirFilesRef = useRef<Map<string, DirFileInfo[]>>(new Map());
 
   useEffect(() => {
     invoke<string>("get_local_machine_id_command")
@@ -204,10 +221,25 @@ function App() {
     const unlistenPromise = listen<PullProgress>("pull-progress", (event) => {
       setPullProgress(event.payload ?? null);
       if (event.payload) {
-        const percent = event.payload.total_bytes > 0
-          ? Math.min(100, Math.round((event.payload.received_bytes / event.payload.total_bytes) * 100))
+        const p = event.payload;
+        // Overall progress based on entry totals
+        const percent = p.entry_total_bytes > 0
+          ? Math.min(100, Math.round((p.entry_received_bytes / p.entry_total_bytes) * 100))
           : 0;
         setProgress(percent);
+        // Speed calculation (smoothed)
+        const now = Date.now();
+        const sr = speedRef.current;
+        const dt = now - sr.lastTime;
+        if (dt > 300 && sr.lastTime > 0) {
+          const bytesPerSec = ((p.entry_received_bytes - sr.lastBytes) / dt) * 1000;
+          sr.speed = sr.speed > 0 ? sr.speed * 0.7 + bytesPerSec * 0.3 : bytesPerSec;
+          sr.lastBytes = p.entry_received_bytes;
+          sr.lastTime = now;
+        } else if (sr.lastTime === 0) {
+          sr.lastBytes = p.entry_received_bytes;
+          sr.lastTime = now;
+        }
       }
     });
 
@@ -259,7 +291,7 @@ function App() {
       for (const entry of entries) {
         if (entry.is_dir) {
           try {
-            const files = await invoke<string[]>("fetch_remote_dir_files_command", {
+            const files = await invoke<DirFileInfo[]>("fetch_remote_dir_files_command", {
               entryId: entry.id,
               targetIp: activeDevice.ip,
               targetPort: activeDevice.port,
@@ -284,7 +316,7 @@ function App() {
       for (const entry of entries) {
         if (entry.is_dir && !dirFilesRef.current.has(entry.id)) {
           try {
-            const files = await invoke<string[]>("list_dir_files_command", { entryId: entry.id });
+            const files = await invoke<DirFileInfo[]>("list_dir_files_command", { entryId: entry.id });
             dirFilesRef.current.set(entry.id, files);
           } catch {
             // ignore
@@ -529,7 +561,7 @@ return (
                         <p className="truncate text-xs text-white/80">{node.name}</p>
                         <p className="text-[10px] text-white/40">
                           {node.isDir
-                            ? `${node.childCount} 项`
+                            ? `${node.childCount} 项${node.size > 0 ? " · " + formatFileSize(node.size) : ""}`
                             : formatFileSize(node.size)}
                         </p>
                       </div>
@@ -705,7 +737,7 @@ return (
                       for (const entry of entries) {
                         if (entry.is_dir) {
                           try {
-                            const files = await invoke<string[]>("fetch_remote_dir_files_command", {
+                            const files = await invoke<DirFileInfo[]>("fetch_remote_dir_files_command", {
                               entryId: entry.id,
                               targetIp: activeDevice.ip,
                               targetPort: activeDevice.port,
@@ -771,7 +803,7 @@ return (
                         <div className="min-w-0 flex-1">
                           <p className="truncate text-xs text-white/80">{node.name}</p>
                           <p className="text-[10px] text-white/40">
-                            {node.isDir ? `${node.childCount} 项` : formatFileSize(node.size)}
+                            {node.isDir ? `${node.childCount} 项${node.size > 0 ? " · " + formatFileSize(node.size) : ""}` : formatFileSize(node.size)}
                           </p>
                         </div>
                         {node.isDir ? (
@@ -800,6 +832,8 @@ return (
                                     setStatusType("info");
                                     setStatusMessage(`正在拉取 ${node.entry.name}...`);
                                     setPullProgress(null);
+                                  speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
+                                    speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
                                     try {
                                       await invoke("pull_file_command", {
                                         entryId: node.entry.id,
@@ -810,10 +844,14 @@ return (
                                       setStatusType("success");
                                       setStatusMessage(`已完成 ${node.entry.name}`);
                                       setPullProgress(null);
+                                  speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
+                                    speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
                                     } catch (error) {
                                       setStatusType("error");
                                       setStatusMessage(`拉取失败: ${String(error)}`);
                                       setPullProgress(null);
+                                  speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
+                                    speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
                                     } finally {
                                       setPullingId(null);
                                     }
@@ -844,6 +882,7 @@ return (
                                   setStatusType("info");
                                   setStatusMessage(`正在拉取 ${node.entry.name}...`);
                                   setPullProgress(null);
+                                  speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
                                   try {
                                     await invoke("pull_file_command", {
                                       entryId: node.entry.id,
@@ -854,10 +893,14 @@ return (
                                     setStatusType("success");
                                     setStatusMessage(`已完成 ${node.entry.name}`);
                                     setPullProgress(null);
+                                  speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
+                                    speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
                                   } catch (error) {
                                     setStatusType("error");
                                     setStatusMessage(`拉取失败: ${String(error)}`);
                                     setPullProgress(null);
+                                  speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
+                                    speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
                                   } finally {
                                     setPullingId(null);
                                   }
@@ -944,10 +987,34 @@ return (
                         transition={{ duration: 0.3, ease: "easeOut" }}
                       />
                     </div>
-                    <div className="text-[10px] text-white/40">
-                      {formatFileSize(pullProgress.received_bytes)} / {" "}
-                      {formatFileSize(pullProgress.total_bytes)}
+                    <div className="flex items-center justify-between text-[10px] text-white/40">
+                      <span>
+                        {formatFileSize(pullProgress.entry_received_bytes)} / {formatFileSize(pullProgress.entry_total_bytes)}
+                        {speedRef.current.speed > 0 && ` · ${formatFileSize(speedRef.current.speed)}/s`}
+                      </span>
+                      <span>
+                        {(() => {
+                          const remaining = pullProgress.entry_total_bytes - pullProgress.entry_received_bytes;
+                          const eta = speedRef.current.speed > 0 ? remaining / speedRef.current.speed : 0;
+                          return eta > 0 ? formatEta(eta) : "";
+                        })()}
+                      </span>
                     </div>
+                    <button
+                      className="w-full rounded border border-rose-500/30 bg-rose-500/10 py-1 text-[10px] text-rose-300 transition hover:bg-rose-500/20"
+                      onClick={async () => {
+                        try {
+                          await invoke("cancel_pull_command");
+                          setStatusType("info");
+                          setStatusMessage("已取消传输");
+                          setPullProgress(null);
+                          setPullingId(null);
+                          speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
+                        } catch { /* ignore */ }
+                      }}
+                    >
+                      取消传输
+                    </button>
                   </div>
                 ) : (
                   <div className="text-center text-white/30">

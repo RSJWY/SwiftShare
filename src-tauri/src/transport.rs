@@ -6,6 +6,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use tokio::sync::RwLock;
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -35,6 +36,32 @@ pub struct PullProgress {
     pub name: String,
     pub received_bytes: u64,
     pub total_bytes: u64,
+    pub entry_received_bytes: u64,
+    pub entry_total_bytes: u64,
+}
+
+/// Cancellation token for pull operations.
+#[derive(Clone)]
+pub struct CancelToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancelToken {
+    pub fn new() -> Self {
+        Self { cancelled: Arc::new(AtomicBool::new(false)) }
+    }
+    pub fn cancel(&self) {
+        self.cancelled.store(true, AtomicOrdering::Relaxed);
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(AtomicOrdering::Relaxed)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirFileInfo {
+    pub path: String,
+    pub size: u64,
 }
 
 #[derive(Clone)]
@@ -418,17 +445,18 @@ async fn handle_connection(peer_key: String, pool: ConnectionPool, shared: Share
             stream.read_exact(&mut payload).await?;
             let id = String::from_utf8_lossy(&payload).to_string();
             let entry = shared.get(&id).await;
-            let file_list: Vec<String> = if let Some(entry) = entry {
+            let file_list: Vec<DirFileInfo> = if let Some(entry) = entry {
                 if entry.is_dir {
                     let dir_path = PathBuf::from(&entry.path);
                     let base = dir_path.parent().unwrap_or(&dir_path).to_path_buf();
                     let mut queue = VecDeque::new();
                     let _ = collect_files(&dir_path, &mut queue);
                     queue.iter().map(|f| {
-                        f.path.strip_prefix(&base)
+                        let rel = f.path.strip_prefix(&base)
                             .unwrap_or(&f.path)
                             .to_string_lossy()
-                            .replace('\\', "/")
+                            .replace('\\', "/");
+                        DirFileInfo { path: rel, size: f.size }
                     }).collect()
                 } else { vec![] }
             } else { vec![] };
@@ -508,9 +536,8 @@ pub async fn list_shared(handle: &TransportHandle) -> Result<Vec<SharedEntry>> {
     Ok(handle.shared.list().await)
 }
 
-/// For a directory entry, return all file relative paths (forward-slash, no leading slash).
-/// e.g. ["MyFolder/sub/file.txt", "MyFolder/file2.txt"]
-pub async fn list_dir_files(handle: &TransportHandle, entry_id: String) -> Result<Vec<String>> {
+/// For a directory entry, return all files with relative paths and sizes.
+pub async fn list_dir_files(handle: &TransportHandle, entry_id: String) -> Result<Vec<DirFileInfo>> {
     let entry = handle.shared.get(&entry_id).await
         .ok_or_else(|| anyhow!("Entry not found: {}", entry_id))?;
     if !entry.is_dir {
@@ -526,7 +553,7 @@ pub async fn list_dir_files(handle: &TransportHandle, entry_id: String) -> Resul
             .unwrap_or(&file.path)
             .to_string_lossy()
             .replace('\\', "/");
-        result.push(rel);
+        result.push(DirFileInfo { path: rel, size: file.size });
     }
     Ok(result)
 }
@@ -541,7 +568,7 @@ pub async fn fetch_remote_dir_files(
     entry_id: String,
     target_ip: String,
     target_port: u16,
-) -> Result<Vec<String>> {
+) -> Result<Vec<DirFileInfo>> {
     let addr = format!("{}:{}", target_ip, target_port);
     let mut stream = handle
         .outbound_pool
@@ -552,7 +579,7 @@ pub async fn fetch_remote_dir_files(
     if packet_type != PacketType::DirListResponse as u16 {
         return Err(anyhow!("Invalid dir list response"));
     }
-    let list: Vec<String> = serde_json::from_slice(&payload)?;
+    let list: Vec<DirFileInfo> = serde_json::from_slice(&payload)?;
     handle.outbound_pool.insert(addr, stream).await;
     Ok(list)
 }
@@ -585,12 +612,16 @@ pub async fn pull_file(
     target_port: u16,
     dest_dir: String,
     max_mbps: u64,
+    cancel: CancelToken,
     mut on_progress: impl FnMut(PullProgress) + Send,
 ) -> Result<String> {
     let addr = format!("{}:{}", target_ip, target_port);
     let mut attempt = 0;
 
     loop {
+        if cancel.is_cancelled() {
+            return Err(anyhow!("Pull cancelled"));
+        }
         let mut stream = handle
             .outbound_pool
             .get_or_connect(&addr, &addr)
@@ -607,12 +638,35 @@ pub async fn pull_file(
         if packet_type == PacketType::DirFileInline as u16
             || packet_type == PacketType::DirFileStream as u16
         {
-            let mut current_pt = packet_type;
-            let mut current_payload = payload;
-            let mut received_name = String::new();
+            // First pass: scan all packets to compute total size, then we can report aggregate progress.
+            // Since we can't re-read from the network, we collect packets in memory.
+            let mut packets: Vec<(u16, Vec<u8>)> = vec![(packet_type, payload)];
             loop {
-                if current_pt == PacketType::DirEnd as u16 {
+                let (pt, pl) = read_packet(&mut stream).await?;
+                if pt == PacketType::DirEnd as u16 {
                     break;
+                }
+                packets.push((pt, pl));
+            }
+            // Compute total bytes
+            let mut entry_total_bytes: u64 = 0;
+            for (_, pl) in &packets {
+                if pl.len() >= 2 {
+                    let nlen = u16::from_be_bytes([pl[0], pl[1]]) as usize;
+                    if pl.len() >= 2 + nlen + 8 {
+                        let s = u64::from_be_bytes([
+                            pl[2 + nlen], pl[3 + nlen], pl[4 + nlen], pl[5 + nlen],
+                            pl[6 + nlen], pl[7 + nlen], pl[8 + nlen], pl[9 + nlen],
+                        ]);
+                        entry_total_bytes += s;
+                    }
+                }
+            }
+            let mut entry_received_bytes: u64 = 0;
+            let mut received_name = String::new();
+            for (current_pt, current_payload) in packets {
+                if cancel.is_cancelled() {
+                    return Err(anyhow!("Pull cancelled"));
                 }
                 let is_inline = current_pt == PacketType::DirFileInline as u16;
                 let is_stream = current_pt == PacketType::DirFileStream as u16;
@@ -631,7 +685,6 @@ pub async fn pull_file(
                     received_name = rel_path.split('/').next().unwrap_or(&rel_path).to_string();
                 }
                 if is_inline {
-                    // Content is in the payload after the meta; CRC is appended at the very end
                     let content_end = current_payload.len().saturating_sub(4);
                     let file_bytes = &current_payload[meta_end..content_end];
                     let expected_crc = u32::from_be_bytes([
@@ -644,30 +697,33 @@ pub async fn pull_file(
                     if actual_crc != expected_crc {
                         return Err(anyhow!("CRC32 mismatch for {}", rel_path));
                     }
-                    if let Some(parent) = target_path.parent() {
-                        fs::create_dir_all(parent).await.ok();
-                    }
                     fs::write(&target_path, file_bytes).await?;
+                    entry_received_bytes += size;
                     on_progress(PullProgress {
                         entry_id: entry_id.clone(),
                         name: rel_path.clone(),
                         received_bytes: size,
                         total_bytes: size,
+                        entry_received_bytes,
+                        entry_total_bytes,
                     });
                 } else {
+                    let cancel_ref = &cancel;
+                    let entry_recv_before = entry_received_bytes;
                     receive_streamed_file(&mut stream, target_path, size, offset, expected_crc, max_mbps, |received| {
+                        if cancel_ref.is_cancelled() { return; }
                         on_progress(PullProgress {
                             entry_id: entry_id.clone(),
                             name: rel_path.clone(),
                             received_bytes: received,
                             total_bytes: size,
+                            entry_received_bytes: entry_recv_before + received,
+                            entry_total_bytes,
                         });
                     })
                     .await?;
+                    entry_received_bytes += size;
                 }
-                let (next_pt, next_payload) = read_packet(&mut stream).await?;
-                current_pt = next_pt;
-                current_payload = next_payload;
             }
             handle.outbound_pool.insert(addr, stream).await;
             return Ok(received_name);
@@ -704,17 +760,23 @@ pub async fn pull_file(
                 name: name.clone(),
                 received_bytes: size,
                 total_bytes: size,
+                entry_received_bytes: size,
+                entry_total_bytes: size,
             });
             handle.outbound_pool.insert(addr, stream).await;
             return Ok(name);
         }
 
+        let cancel_ref = &cancel;
         let result = receive_streamed_file(&mut stream, target_path, size, offset, expected_crc, max_mbps, |received| {
+            if cancel_ref.is_cancelled() { return; }
             on_progress(PullProgress {
                 entry_id: entry_id.clone(),
                 name: name.clone(),
                 received_bytes: received,
                 total_bytes: size,
+                entry_received_bytes: received,
+                entry_total_bytes: size,
             });
         })
         .await;
