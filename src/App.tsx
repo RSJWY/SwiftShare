@@ -8,6 +8,7 @@ import { Store } from "@tauri-apps/plugin-store";
 import { startDrag } from "@crabnebula/tauri-plugin-drag";
 import { motion } from "framer-motion";
 import "./App.css";
+import { checkForAppUpdates } from "./updater";
 
 type DeviceInfo = {
   machine_id: string;
@@ -202,6 +203,14 @@ function App() {
         console.warn("Failed to get local port:", err);
         setLocalPort(0);
       });
+  }, []);
+
+  // Auto-check for updates 3 seconds after startup
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      checkForAppUpdates(false);
+    }, 3000);
+    return () => clearTimeout(timer);
   }, []);
 
   useEffect(() => {
@@ -1186,6 +1195,20 @@ return (
                   setSettingsOpen(false);
                 }}
               >
+                <div className="glass-card flex items-center justify-between p-4">
+                  <div>
+                    <p className="text-sm text-white">检查更新</p>
+                    <p className="text-xs text-white/50">检查是否有新版本可用</p>
+                  </div>
+                  <button
+                    className="subtle-button"
+                    type="button"
+                    onClick={() => checkForAppUpdates(true)}
+                  >
+                    检查更新
+                  </button>
+                </div>
+
                 <div className="glass-card p-4">
                   <label className="text-xs text-white/60">下载目录</label>
                   <div className="mt-2 flex items-center gap-2">
