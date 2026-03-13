@@ -612,6 +612,7 @@ pub async fn pull_file(
     target_port: u16,
     dest_dir: String,
     max_mbps: u64,
+    entry_total_size: u64,
     cancel: CancelToken,
     mut on_progress: impl FnMut(PullProgress) + Send,
 ) -> Result<String> {
@@ -638,33 +639,15 @@ pub async fn pull_file(
         if packet_type == PacketType::DirFileInline as u16
             || packet_type == PacketType::DirFileStream as u16
         {
-            // First pass: scan all packets to compute total size, then we can report aggregate progress.
-            // Since we can't re-read from the network, we collect packets in memory.
-            let mut packets: Vec<(u16, Vec<u8>)> = vec![(packet_type, payload)];
+            let entry_total_bytes = entry_total_size;
+            let mut entry_received_bytes: u64 = 0;
+            let mut current_pt = packet_type;
+            let mut current_payload = payload;
+            let mut received_name = String::new();
             loop {
-                let (pt, pl) = read_packet(&mut stream).await?;
-                if pt == PacketType::DirEnd as u16 {
+                if current_pt == PacketType::DirEnd as u16 {
                     break;
                 }
-                packets.push((pt, pl));
-            }
-            // Compute total bytes
-            let mut entry_total_bytes: u64 = 0;
-            for (_, pl) in &packets {
-                if pl.len() >= 2 {
-                    let nlen = u16::from_be_bytes([pl[0], pl[1]]) as usize;
-                    if pl.len() >= 2 + nlen + 8 {
-                        let s = u64::from_be_bytes([
-                            pl[2 + nlen], pl[3 + nlen], pl[4 + nlen], pl[5 + nlen],
-                            pl[6 + nlen], pl[7 + nlen], pl[8 + nlen], pl[9 + nlen],
-                        ]);
-                        entry_total_bytes += s;
-                    }
-                }
-            }
-            let mut entry_received_bytes: u64 = 0;
-            let mut received_name = String::new();
-            for (current_pt, current_payload) in packets {
                 if cancel.is_cancelled() {
                     return Err(anyhow!("Pull cancelled"));
                 }
@@ -724,6 +707,9 @@ pub async fn pull_file(
                     .await?;
                     entry_received_bytes += size;
                 }
+                let (next_pt, next_payload) = read_packet(&mut stream).await?;
+                current_pt = next_pt;
+                current_payload = next_payload;
             }
             handle.outbound_pool.insert(addr, stream).await;
             return Ok(received_name);

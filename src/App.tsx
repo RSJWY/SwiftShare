@@ -404,6 +404,7 @@ function App() {
         entryId: entry.id,
         targetIp: activeDevice.ip,
         targetPort: activeDevice.port,
+        entrySize: entry.size,
       });
       await startDrag({
         item: [path],
@@ -832,7 +833,6 @@ return (
                                     setStatusType("info");
                                     setStatusMessage(`正在拉取 ${node.entry.name}...`);
                                     setPullProgress(null);
-                                  speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
                                     speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
                                     try {
                                       await invoke("pull_file_command", {
@@ -840,18 +840,17 @@ return (
                                         targetIp: activeDevice!.ip,
                                         targetPort: activeDevice!.port,
                                         destDir: dir,
+                                        entrySize: node.entry.size,
                                       });
                                       setStatusType("success");
                                       setStatusMessage(`已完成 ${node.entry.name}`);
                                       setPullProgress(null);
-                                  speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
-                                    speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
+                                      speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
                                     } catch (error) {
                                       setStatusType("error");
                                       setStatusMessage(`拉取失败: ${String(error)}`);
                                       setPullProgress(null);
-                                  speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
-                                    speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
+                                      speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
                                     } finally {
                                       setPullingId(null);
                                     }
@@ -889,17 +888,16 @@ return (
                                       targetIp: activeDevice!.ip,
                                       targetPort: activeDevice!.port,
                                       destDir: dir,
+                                      entrySize: node.entry.size,
                                     });
                                     setStatusType("success");
                                     setStatusMessage(`已完成 ${node.entry.name}`);
                                     setPullProgress(null);
-                                  speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
                                     speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
                                   } catch (error) {
                                     setStatusType("error");
                                     setStatusMessage(`拉取失败: ${String(error)}`);
                                     setPullProgress(null);
-                                  speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
                                     speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
                                   } finally {
                                     setPullingId(null);

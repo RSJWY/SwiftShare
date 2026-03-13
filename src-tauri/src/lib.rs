@@ -87,6 +87,7 @@ async fn pull_file_command(
     target_ip: String,
     target_port: u16,
     dest_dir: String,
+    entry_size: u64,
 ) -> Result<(), String> {
     let settings = SETTINGS_STATE
         .get_or_init(|| Arc::new(SettingsState::new()))
@@ -100,7 +101,7 @@ async fn pull_file_command(
         let mut guard = get_pull_cancel().lock().await;
         *guard = Some(cancel.clone());
     }
-    let result = pull_file(&transport, entry_id, target_ip, target_port, dest_dir, max_mbps, cancel, |progress| {
+    let result = pull_file(&transport, entry_id, target_ip, target_port, dest_dir, max_mbps, entry_size, cancel, |progress| {
         let _ = app.emit("pull-progress", progress.clone());
     })
     .await
@@ -119,6 +120,7 @@ async fn pull_to_temp_command(
     entry_id: String,
     target_ip: String,
     target_port: u16,
+    entry_size: u64,
 ) -> Result<String, String> {
     let temp_root: std::path::PathBuf = app
         .path()
@@ -147,6 +149,7 @@ async fn pull_to_temp_command(
         target_port,
         cache_dir.to_string_lossy().to_string(),
         max_mbps,
+        entry_size,
         cancel,
         |progress| {
         let _ = app.emit("pull-progress", progress.clone());
