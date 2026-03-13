@@ -40,6 +40,12 @@ type DirFileInfo = {
   size: number;
 };
 
+type ConflictInfo = {
+  has_conflict: boolean;
+  conflicting_files: string[];
+  total_conflict_size: number;
+};
+
 type Settings = {
   downloadDir: string;
   maxConcurrent: number;
@@ -106,6 +112,9 @@ function App() {
   const [bottomHeight, setBottomHeight] = useState(224);
   const [leftColWidth, setLeftColWidth] = useState(280);
   const [rightColWidth, setRightColWidth] = useState(260);
+  // Conflict dialog state
+  const [conflictInfo, setConflictInfo] = useState<ConflictInfo | null>(null);
+  const conflictCallbackRef = useRef<(() => void) | null>(null);
 
   // Build a virtual tree node list for browsing.
   // Returns { name, isDir, entry? } for each visible item at the given path.
@@ -304,6 +313,41 @@ function App() {
       }
     });
   }, [activeDevice]);
+
+  // Auto-refresh remote shared list periodically
+  useEffect(() => {
+    if (!activeDevice) return;
+    const intervalId = setInterval(async () => {
+      // Skip refresh while pulling to avoid TCP connection contention
+      if (pullingId) return;
+      try {
+        const list = await invoke<SharedEntry[]>("fetch_remote_list_command", {
+          targetIp: activeDevice.ip,
+          targetPort: activeDevice.port,
+        });
+        const entries = list ?? [];
+        setRemoteList(entries);
+        // Update dirFilesRef for directory entries, clean stale keys
+        const newIds = new Set(entries.filter(e => e.is_dir).map(e => e.id));
+        for (const key of dirFilesRef.current.keys()) {
+          if (!newIds.has(key)) dirFilesRef.current.delete(key);
+        }
+        for (const entry of entries) {
+          if (entry.is_dir) {
+            try {
+              const files = await invoke<DirFileInfo[]>("fetch_remote_dir_files_command", {
+                entryId: entry.id,
+                targetIp: activeDevice.ip,
+                targetPort: activeDevice.port,
+              });
+              dirFilesRef.current.set(entry.id, files);
+            } catch { /* ignore */ }
+          }
+        }
+      } catch { /* device may have gone offline */ }
+    }, settings.discoveryIntervalMs);
+    return () => clearInterval(intervalId);
+  }, [activeDevice, settings.discoveryIntervalMs]);
 
   const addSharedFiles = async (paths: string[]) => {
     if (paths.length === 0) return;
@@ -828,31 +872,51 @@ return (
                                     dir = folder;
                                   }
                                   if (node.entry) {
-                                    setPullingId(node.entry.id);
-                                    setProgress(0);
-                                    setStatusType("info");
-                                    setStatusMessage(`正在拉取 ${node.entry.name}...`);
-                                    setPullProgress(null);
-                                    speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
+                                    const doPull = async () => {
+                                      setPullingId(node.entry!.id);
+                                      setProgress(0);
+                                      setStatusType("info");
+                                      setStatusMessage(`正在拉取 ${node.entry!.name}...`);
+                                      setPullProgress(null);
+                                      speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
+                                      try {
+                                        await invoke("pull_file_command", {
+                                          entryId: node.entry!.id,
+                                          targetIp: activeDevice!.ip,
+                                          targetPort: activeDevice!.port,
+                                          destDir: dir,
+                                          entrySize: node.entry!.size,
+                                        });
+                                        setStatusType("success");
+                                        setStatusMessage(`已完成 ${node.entry!.name}`);
+                                        setPullProgress(null);
+                                        speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
+                                      } catch (error) {
+                                        setStatusType("error");
+                                        setStatusMessage(`拉取失败: ${String(error)}`);
+                                        setPullProgress(null);
+                                        speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
+                                      } finally {
+                                        setPullingId(null);
+                                      }
+                                    };
                                     try {
-                                      await invoke("pull_file_command", {
+                                      const conflict = await invoke<ConflictInfo>("check_pull_conflict_command", {
+                                        entryName: node.entry.name,
+                                        entryIsDir: node.entry.is_dir,
                                         entryId: node.entry.id,
                                         targetIp: activeDevice!.ip,
                                         targetPort: activeDevice!.port,
                                         destDir: dir,
-                                        entrySize: node.entry.size,
                                       });
-                                      setStatusType("success");
-                                      setStatusMessage(`已完成 ${node.entry.name}`);
-                                      setPullProgress(null);
-                                      speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
-                                    } catch (error) {
-                                      setStatusType("error");
-                                      setStatusMessage(`拉取失败: ${String(error)}`);
-                                      setPullProgress(null);
-                                      speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
-                                    } finally {
-                                      setPullingId(null);
+                                      if (conflict.has_conflict) {
+                                        setConflictInfo(conflict);
+                                        conflictCallbackRef.current = doPull;
+                                      } else {
+                                        await doPull();
+                                      }
+                                    } catch {
+                                      await doPull();
                                     }
                                   }
                                 }}
@@ -876,31 +940,51 @@ return (
                                   dir = folder;
                                 }
                                 if (node.entry) {
-                                  setPullingId(node.entry.id);
-                                  setProgress(0);
-                                  setStatusType("info");
-                                  setStatusMessage(`正在拉取 ${node.entry.name}...`);
-                                  setPullProgress(null);
-                                  speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
+                                  const doPull = async () => {
+                                    setPullingId(node.entry!.id);
+                                    setProgress(0);
+                                    setStatusType("info");
+                                    setStatusMessage(`正在拉取 ${node.entry!.name}...`);
+                                    setPullProgress(null);
+                                    speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
+                                    try {
+                                      await invoke("pull_file_command", {
+                                        entryId: node.entry!.id,
+                                        targetIp: activeDevice!.ip,
+                                        targetPort: activeDevice!.port,
+                                        destDir: dir,
+                                        entrySize: node.entry!.size,
+                                      });
+                                      setStatusType("success");
+                                      setStatusMessage(`已完成 ${node.entry!.name}`);
+                                      setPullProgress(null);
+                                      speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
+                                    } catch (error) {
+                                      setStatusType("error");
+                                      setStatusMessage(`拉取失败: ${String(error)}`);
+                                      setPullProgress(null);
+                                      speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
+                                    } finally {
+                                      setPullingId(null);
+                                    }
+                                  };
                                   try {
-                                    await invoke("pull_file_command", {
+                                    const conflict = await invoke<ConflictInfo>("check_pull_conflict_command", {
+                                      entryName: node.entry.name,
+                                      entryIsDir: node.entry.is_dir,
                                       entryId: node.entry.id,
                                       targetIp: activeDevice!.ip,
                                       targetPort: activeDevice!.port,
                                       destDir: dir,
-                                      entrySize: node.entry.size,
                                     });
-                                    setStatusType("success");
-                                    setStatusMessage(`已完成 ${node.entry.name}`);
-                                    setPullProgress(null);
-                                    speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
-                                  } catch (error) {
-                                    setStatusType("error");
-                                    setStatusMessage(`拉取失败: ${String(error)}`);
-                                    setPullProgress(null);
-                                    speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
-                                  } finally {
-                                    setPullingId(null);
+                                    if (conflict.has_conflict) {
+                                      setConflictInfo(conflict);
+                                      conflictCallbackRef.current = doPull;
+                                    } else {
+                                      await doPull();
+                                    }
+                                  } catch {
+                                    await doPull();
                                   }
                                 }
                               }}
@@ -1031,6 +1115,48 @@ return (
           <div className="glass-card px-8 py-6 text-center">
             <p className="text-lg font-semibold text-white">松开即可发送</p>
             <p className="text-xs text-white/50">将文件添加到共享列表</p>
+          </div>
+        </div>
+      )}
+
+      {conflictInfo && (
+        <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/50 backdrop-blur-sm">
+          <div className="glass-panel w-full max-w-md p-6">
+            <h2 className="text-lg font-semibold text-white">文件冲突</h2>
+            <p className="mt-3 text-sm text-white/70">
+              目标目录中已存在 {conflictInfo.conflicting_files.length} 个同名文件
+              （共 {formatFileSize(conflictInfo.total_conflict_size)}），继续拉取将覆盖这些文件。
+            </p>
+            <div className="mt-3 max-h-40 overflow-y-auto rounded bg-white/5 p-2">
+              {conflictInfo.conflicting_files.slice(0, 50).map((f) => (
+                <p key={f} className="truncate text-xs text-white/50">{f}</p>
+              ))}
+              {conflictInfo.conflicting_files.length > 50 && (
+                <p className="text-xs text-white/40">...及另外 {conflictInfo.conflicting_files.length - 50} 个文件</p>
+              )}
+            </div>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                className="subtle-button"
+                onClick={() => {
+                  setConflictInfo(null);
+                  conflictCallbackRef.current = null;
+                }}
+              >
+                取消
+              </button>
+              <button
+                className="glow-button"
+                onClick={() => {
+                  setConflictInfo(null);
+                  const cb = conflictCallbackRef.current;
+                  conflictCallbackRef.current = null;
+                  if (cb) cb();
+                }}
+              >
+                覆盖
+              </button>
+            </div>
           </div>
         </div>
       )}

@@ -315,7 +315,15 @@ async fn handle_connection(peer_key: String, pool: ConnectionPool, shared: Share
                 collect_files(&dir_path, &mut file_queue)?;
                 // parent of dir_path, so relative paths start with the dir name
                 let base = dir_path.parent().unwrap_or(&dir_path);
+                let mut revoked = false;
                 for file_entry in file_queue {
+                    // Re-check if shared entry still exists (may have been cleared)
+                    if shared.get(&id).await.is_none() {
+                        let msg = format!("Shared entry revoked: {}", id);
+                        write_packet(&mut stream, PacketType::Error, 0, msg.as_bytes()).await?;
+                        revoked = true;
+                        break;
+                    }
                     let rel = file_entry.path.strip_prefix(base)
                         .unwrap_or(&file_entry.path)
                         .to_string_lossy()
@@ -367,7 +375,9 @@ async fn handle_connection(peer_key: String, pool: ConnectionPool, shared: Share
                         }
                     }
                 }
-                write_packet(&mut stream, PacketType::DirEnd, 0, &[]).await?;
+                if !revoked {
+                    write_packet(&mut stream, PacketType::DirEnd, 0, &[]).await?;
+                }
             } else {
                 let path = PathBuf::from(entry.path.clone());
                 let metadata = match fs::metadata(&path).await {
@@ -563,6 +573,55 @@ pub async fn clear_shared(handle: &TransportHandle) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ConflictInfo {
+    pub has_conflict: bool,
+    pub conflicting_files: Vec<String>,
+    pub total_conflict_size: u64,
+}
+
+/// Check whether pulling an entry into `dest_dir` would overwrite existing files.
+/// For directories, calls `fetch_remote_dir_files` to get the file list and checks each.
+/// For single files, checks `dest_dir/name`.
+pub async fn check_pull_conflict(
+    handle: &TransportHandle,
+    entry_name: String,
+    entry_is_dir: bool,
+    entry_id: String,
+    target_ip: String,
+    target_port: u16,
+    dest_dir: String,
+) -> Result<ConflictInfo> {
+    let dest = PathBuf::from(&dest_dir);
+    let mut conflicting_files = Vec::new();
+    let mut total_conflict_size: u64 = 0;
+
+    if entry_is_dir {
+        let files = fetch_remote_dir_files(handle, entry_id, target_ip, target_port).await?;
+        for file_info in &files {
+            let local_path = dest.join(file_info.path.replace('/', std::path::MAIN_SEPARATOR_STR));
+            if local_path.exists() {
+                conflicting_files.push(file_info.path.clone());
+                total_conflict_size += file_info.size;
+            }
+        }
+    } else {
+        let local_path = dest.join(&entry_name);
+        if local_path.exists() {
+            if let Ok(meta) = std::fs::metadata(&local_path) {
+                total_conflict_size += meta.len();
+            }
+            conflicting_files.push(entry_name);
+        }
+    }
+
+    Ok(ConflictInfo {
+        has_conflict: !conflicting_files.is_empty(),
+        conflicting_files,
+        total_conflict_size,
+    })
+}
+
 pub async fn fetch_remote_dir_files(
     handle: &TransportHandle,
     entry_id: String,
@@ -647,6 +706,10 @@ pub async fn pull_file(
             loop {
                 if current_pt == PacketType::DirEnd as u16 {
                     break;
+                }
+                if current_pt == PacketType::Error as u16 {
+                    let msg = String::from_utf8_lossy(&current_payload).to_string();
+                    return Err(anyhow!(msg));
                 }
                 if cancel.is_cancelled() {
                     return Err(anyhow!("Pull cancelled"));

@@ -4,7 +4,7 @@ use anyhow::Result;
 use transport::{start_listener, start_transfer, TransportHandle};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, Semaphore};
-use transport::{add_shared, clear_shared, fetch_remote_dir_files, fetch_remote_list, list_shared, list_dir_files, pull_file, SharedEntry, DirFileInfo, CancelToken};
+use transport::{add_shared, clear_shared, check_pull_conflict, fetch_remote_dir_files, fetch_remote_list, list_shared, list_dir_files, pull_file, SharedEntry, DirFileInfo, ConflictInfo, CancelToken};
 use tauri::{Emitter, Manager, WindowEvent};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::fs;
@@ -76,6 +76,21 @@ async fn fetch_remote_dir_files_command(entry_id: String, target_ip: String, tar
 async fn fetch_remote_list_command(target_ip: String, target_port: u16) -> Result<Vec<SharedEntry>, String> {
     let transport = wait_transport().await?;
     fetch_remote_list(&transport, target_ip, target_port)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn check_pull_conflict_command(
+    entry_name: String,
+    entry_is_dir: bool,
+    entry_id: String,
+    target_ip: String,
+    target_port: u16,
+    dest_dir: String,
+) -> Result<ConflictInfo, String> {
+    let transport = wait_transport().await?;
+    check_pull_conflict(&transport, entry_name, entry_is_dir, entry_id, target_ip, target_port, dest_dir)
         .await
         .map_err(|e| e.to_string())
 }
@@ -331,6 +346,7 @@ pub fn run() {
             pull_file_command,
             pull_to_temp_command,
             cancel_pull_command,
+            check_pull_conflict_command,
             get_local_machine_id_command,
             get_local_port_command,
             notify_offline_command,
