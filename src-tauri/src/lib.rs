@@ -264,14 +264,14 @@ async fn update_settings_command(
 }
 
 #[tauri::command]
-fn is_portable_mode_command(app: tauri::AppHandle) -> bool {
+fn is_portable_mode_command() -> bool {
     if std::env::var("SWIFTSHARE_PORTABLE").ok().as_deref() == Some("1") {
         return true;
     }
 
     #[cfg(windows)]
     {
-        let exe_path = match app.path().executable() {
+        let exe_path = match std::env::current_exe() {
             Ok(path) => path,
             Err(_) => return false,
         };
