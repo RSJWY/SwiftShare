@@ -44,7 +44,7 @@
       "endpoints": [
         "https://github.com/RSJWY/SwiftShare/releases/latest/download/latest.json"
       ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDJBQTZFNDFDRTBFN0NFQ0YKUldUUHp1ZmdIT1NtS3RIcmpiNWpXKytHWmpmOTFUbU45cmhtaHY1UjZzRnB1NU1rUVBnN1AxZ1oK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEY1M0ZGNkU1OUM5Qzg5N0UKUldSK2laeWM1ZlkvOWFuSCtBTFRVL2dJeWJieVlJa2NLZmRldnZzcG5rUTJsMjdrMGRDU3lPU0YK",
       "windows": {
         "installMode": "passive"
       }
