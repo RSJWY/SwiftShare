@@ -418,7 +418,7 @@ fn is_virtual_interface(name: &str) -> bool {
     let lowered = name.to_lowercase();
     let patterns = [
         "virtual", "vmware", "hyper-v", "vbox", "virtualbox",
-        "veth", "docker", "wsl", "bridge", "tap", "tun",
+        "veth", "docker", "wsl", "tap", "tun",
         "hamachi", "zerotier", "loopback", "npf",
     ];
     patterns.iter().any(|p| lowered.contains(p))

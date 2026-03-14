@@ -225,10 +225,8 @@ function App() {
 
   useEffect(() => {
     const win = getCurrentWindow();
-    const unlistenPromise = win.onCloseRequested(async (event) => {
-      event.preventDefault();
-      await invoke("notify_offline_command").catch(() => {});
-      await win.destroy();
+    const unlistenPromise = win.onCloseRequested(() => {
+      void invoke("notify_offline_command").catch(() => {});
     });
     return () => {
       unlistenPromise.then((unlisten) => unlisten());
