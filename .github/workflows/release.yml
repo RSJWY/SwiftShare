@@ -101,3 +101,12 @@ jobs:
           if [ -f "$EXE" ]; then
             gh release upload "$TAG" "$EXE#SwiftShare_portable.exe" --clobber
           fi
+
+      - name: Upload artifacts (manual trigger)
+        if: github.event_name == 'workflow_dispatch' && matrix.platform == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: SwiftShare-build-${{ github.run_number }}
+          path: |
+            src-tauri/target/release/SwiftShare.exe
+            src-tauri/target/release/bundle/nsis/
