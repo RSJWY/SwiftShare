@@ -751,15 +751,15 @@ pub async fn pull_file(
                         return Err(anyhow!("CRC32 mismatch for {}", rel_path));
                     }
                     fs::write(&target_path, file_bytes).await?;
-                    entry_received_bytes += size;
                     on_progress(PullProgress {
                         entry_id: entry_id.clone(),
                         name: rel_path.clone(),
                         received_bytes: size,
                         total_bytes: size,
-                        entry_received_bytes,
+                        entry_received_bytes: entry_received_bytes + size,
                         entry_total_bytes,
                     });
+                    entry_received_bytes += size;
                 } else {
                     let cancel_ref = &cancel;
                     let entry_recv_before = entry_received_bytes;
@@ -817,7 +817,7 @@ pub async fn pull_file(
                 received_bytes: size,
                 total_bytes: size,
                 entry_received_bytes: size,
-                entry_total_bytes: size,
+                entry_total_bytes: entry_total_size,
             });
             handle.outbound_pool.insert(addr, stream).await;
             return Ok(name);
@@ -832,7 +832,7 @@ pub async fn pull_file(
                 received_bytes: received,
                 total_bytes: size,
                 entry_received_bytes: received,
-                entry_total_bytes: size,
+                entry_total_bytes: entry_total_size,
             });
         })
         .await;
