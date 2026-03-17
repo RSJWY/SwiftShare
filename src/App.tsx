@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Store } from "@tauri-apps/plugin-store";
 import { startDrag } from "@crabnebula/tauri-plugin-drag";
@@ -224,13 +224,27 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const win = getCurrentWindow();
-    const unlistenPromise = win.onCloseRequested(async () => {
-      await invoke("notify_offline_command").catch(() => {});
-      await win.close();
-    });
+    let unlisten: (() => void) | undefined;
+
+    const setupListener = async () => {
+      const win = getCurrentWebviewWindow();
+      unlisten = await win.onCloseRequested(async (event) => {
+        // 阻止默认关闭行为
+        event.preventDefault();
+        try {
+          await invoke("notify_offline_command");
+        } catch {
+          // ignore
+        }
+        // 使用 destroy() 强制关闭窗口，避免递归触发 onCloseRequested
+        await win.destroy();
+      });
+    };
+
+    setupListener();
+
     return () => {
-      unlistenPromise.then((unlisten) => unlisten());
+      if (unlisten) unlisten();
     };
   }, []);
 

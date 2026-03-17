@@ -429,23 +429,35 @@ fn is_loopback(addr: &IpAddr) -> bool {
 
 fn is_virtual_interface(name: &str) -> bool {
     let lowered = name.to_lowercase();
-    // 排除虚拟网卡，但保留桥接网卡（如 Hyper-V 虚拟交换机的桥接）
-    // 虚拟网卡特征：veth, docker, wsl, tap, tun, hamachi, zerotier, loopback, npf
-    // 保留：以太网、WiFi、Ethernet、WLAN、Intel、Realtek、Broadcom 等真实网卡
-    let virtual_patterns = [
-        "veth", "docker", "wsl", "tap", "tun",
-        "hamachi", "zerotier", "loopback", "npf",
+    
+    // 白名单：明确保留的网卡名称模式（真实网卡和虚拟机通信网卡）
+    // 这些模式即使包含虚拟关键字也保留
+    let keep_patterns = [
+        "ethernet", "wifi", "wlan", "lan", "以太网", "无线",
+        "intel", "realtek", "broadcom", "qualcomm", "mediatek",
+        "vmware", "virtualbox", "parallels", "hyper-v", "hyperv",
+        "vEthernet", "bridge", "nat", "vnic",
     ];
-
+    
+    // 如果匹配白名单，直接保留
+    if keep_patterns.iter().any(|p| lowered.contains(&p.to_lowercase())) {
+        return false;
+    }
+    
+    // 黑名单：明确排除的虚拟网卡
+    let virtual_patterns = [
+        "veth", "docker", "wsl", "loopback", "npf",
+        "hamachi", "zerotier", "tailscale", "wireguard",
+        "tun", "tap",  // VPN 虚拟网卡
+    ];
+    
     // 检查是否是虚拟网卡
     if virtual_patterns.iter().any(|p| lowered.contains(p)) {
         return true;
     }
 
-    // VMware 和 VirtualBox 的虚拟网卡通常有特定的 MAC 前缀或名称
-    // 但桥接模式下会使用真实网卡，所以这里不过滤
-    // 只过滤明确的虚拟网卡名称
-    if lowered.contains("virtual") && !lowered.contains("ethernet") {
+    // 其他包含 "virtual" 的网卡名称也要过滤（但已通过白名单的除外）
+    if lowered.contains("virtual") {
         return true;
     }
 
