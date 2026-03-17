@@ -124,6 +124,14 @@ function App() {
   const [isClosing, setIsClosing] = useState(false);
   // Update checking state
   const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
+  // Transfer history
+  const [transferHistory, setTransferHistory] = useState<Array<{
+    name: string;
+    size: number;
+    type: "pull" | "push";
+    timestamp: number;
+    status: "success" | "error";
+  }>>([]);
 
   // Build a virtual tree node list for browsing.
   // Returns { name, isDir, entry? } for each visible item at the given path.
@@ -924,10 +932,12 @@ return (
                                   }
                                   if (node.entry) {
                                     const doPull = async () => {
+                                      const entryName = node.entry!.name;
+                                      const entrySize = node.entry!.size;
                                       setPullingId(node.entry!.id);
                                       setProgress(0);
                                       setStatusType("info");
-                                      setStatusMessage(`正在拉取 ${node.entry!.name}...`);
+                                      setStatusMessage(`正在拉取 ${entryName}...`);
                                       setPullProgress(null);
                                       speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
                                       try {
@@ -936,17 +946,33 @@ return (
                                           targetIp: activeDevice!.ip,
                                           targetPort: activeDevice!.port,
                                           destDir: dir,
-                                          entrySize: node.entry!.size,
+                                          entrySize: entrySize,
                                         });
                                         setStatusType("success");
-                                        setStatusMessage(`已完成 ${node.entry!.name}`);
+                                        setStatusMessage(`已完成 ${entryName}`);
                                         setPullProgress(null);
                                         speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
+                                        // Add to history
+                                        setTransferHistory(prev => [{
+                                          name: entryName,
+                                          size: entrySize,
+                                          type: "pull" as const,
+                                          timestamp: Date.now(),
+                                          status: "success" as const,
+                                        }, ...prev].slice(0, 20));
                                       } catch (error) {
                                         setStatusType("error");
                                         setStatusMessage(`拉取失败: ${String(error)}`);
                                         setPullProgress(null);
                                         speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
+                                        // Add to history
+                                        setTransferHistory(prev => [{
+                                          name: entryName,
+                                          size: entrySize,
+                                          type: "pull" as const,
+                                          timestamp: Date.now(),
+                                          status: "error" as const,
+                                        }, ...prev].slice(0, 20));
                                       } finally {
                                         setPullingId(null);
                                       }
@@ -991,34 +1017,52 @@ return (
                                   dir = folder;
                                 }
                                 if (node.entry) {
-                                  const doPull = async () => {
-                                    setPullingId(node.entry!.id);
-                                    setProgress(0);
-                                    setStatusType("info");
-                                    setStatusMessage(`正在拉取 ${node.entry!.name}...`);
-                                    setPullProgress(null);
-                                    speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
-                                    try {
-                                      await invoke("pull_file_command", {
-                                        entryId: node.entry!.id,
-                                        targetIp: activeDevice!.ip,
-                                        targetPort: activeDevice!.port,
-                                        destDir: dir,
-                                        entrySize: node.entry!.size,
-                                      });
-                                      setStatusType("success");
-                                      setStatusMessage(`已完成 ${node.entry!.name}`);
-                                      setPullProgress(null);
-                                      speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
-                                    } catch (error) {
-                                      setStatusType("error");
-                                      setStatusMessage(`拉取失败: ${String(error)}`);
-                                      setPullProgress(null);
-                                      speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
-                                    } finally {
-                                      setPullingId(null);
-                                    }
-                                  };
+                                   const doPull = async () => {
+                                     const entryName = node.entry!.name;
+                                     const entrySize = node.entry!.size;
+                                     setPullingId(node.entry!.id);
+                                     setProgress(0);
+                                     setStatusType("info");
+                                     setStatusMessage(`正在拉取 ${entryName}...`);
+                                     setPullProgress(null);
+                                     speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
+                                     try {
+                                       await invoke("pull_file_command", {
+                                         entryId: node.entry!.id,
+                                         targetIp: activeDevice!.ip,
+                                         targetPort: activeDevice!.port,
+                                         destDir: dir,
+                                         entrySize: entrySize,
+                                       });
+                                       setStatusType("success");
+                                       setStatusMessage(`已完成 ${entryName}`);
+                                       setPullProgress(null);
+                                       speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
+                                       // Add to history
+                                       setTransferHistory(prev => [{
+                                         name: entryName,
+                                         size: entrySize,
+                                         type: "pull" as const,
+                                         timestamp: Date.now(),
+                                         status: "success" as const,
+                                       }, ...prev].slice(0, 20));
+                                     } catch (error) {
+                                       setStatusType("error");
+                                       setStatusMessage(`拉取失败: ${String(error)}`);
+                                       setPullProgress(null);
+                                       speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
+                                       // Add to history
+                                       setTransferHistory(prev => [{
+                                         name: entryName,
+                                         size: entrySize,
+                                         type: "pull" as const,
+                                         timestamp: Date.now(),
+                                         status: "error" as const,
+                                       }, ...prev].slice(0, 20));
+                                     } finally {
+                                       setPullingId(null);
+                                     }
+                                   };
                                   try {
                                     const conflict = await invoke<ConflictInfo>("check_pull_conflict_command", {
                                       entryName: node.entry.name,
@@ -1084,74 +1128,182 @@ return (
               <div className="h-12 w-0.5 rounded-full bg-white/20 transition group-hover:bg-white/50" />
             </div>
 
-            {/* Right: Transfer Progress (Simplified) */}
+            {/* Right: Transfer Progress */}
             <div className="flex flex-col overflow-hidden rounded-xl border border-white/10 bg-white/5">
-              <div className="flex items-center border-b border-white/10 px-3 py-2">
+              <div className="flex items-center justify-between border-b border-white/10 px-3 py-2">
                 <span className="text-xs font-medium text-white/70">传输状态</span>
-              </div>
-              <div className="flex flex-1 flex-col justify-center gap-3 p-3">
-                {/* Status Message */}
-                {statusMessage && (
-                  <div
-                    className={`rounded-lg px-3 py-2 text-[11px] ${
-                      statusType === "success"
-                        ? "bg-emerald-500/15 text-emerald-200"
-                        : statusType === "error"
-                        ? "bg-rose-500/15 text-rose-200"
-                        : "bg-white/10 text-white/70"
-                    }`}
+                {pullProgress && (
+                  <button
+                    className="text-[10px] text-rose-400/70 hover:text-rose-300 transition"
+                    onClick={async () => {
+                      try {
+                        await invoke("cancel_pull_command");
+                        setStatusType("info");
+                        setStatusMessage("已取消传输");
+                        setPullProgress(null);
+                        setPullingId(null);
+                        speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
+                      } catch { /* ignore */ }
+                    }}
                   >
-                    {statusMessage}
-                  </div>
+                    取消
+                  </button>
                 )}
-
-                {/* Current Transfer */}
+              </div>
+              <div className="flex flex-1 flex-col overflow-hidden">
                 {pullProgress ? (
-                  <div className="space-y-2">
-                    <div className="flex items-center justify-between text-xs text-white/50">
-                      <span className="truncate">{pullProgress.name}</span>
-                      <span>{progress}%</span>
+                  /* Active Transfer */
+                  <div className="flex flex-col items-center justify-center gap-3 p-4">
+                    {/* Animated Progress Ring */}
+                    <div className="relative h-16 w-16">
+                      <svg className="h-16 w-16 -rotate-90 transform" viewBox="0 0 64 64">
+                        <circle
+                          cx="32"
+                          cy="32"
+                          r="28"
+                          fill="none"
+                          stroke="rgba(255,255,255,0.1)"
+                          strokeWidth="6"
+                        />
+                        <motion.circle
+                          cx="32"
+                          cy="32"
+                          r="28"
+                          fill="none"
+                          stroke="url(#progressGradient)"
+                          strokeWidth="6"
+                          strokeLinecap="round"
+                          strokeDasharray={2 * Math.PI * 28}
+                          strokeDashoffset={2 * Math.PI * 28 * (1 - progress / 100)}
+                          initial={{ strokeDashoffset: 2 * Math.PI * 28 }}
+                          animate={{ strokeDashoffset: 2 * Math.PI * 28 * (1 - progress / 100) }}
+                          transition={{ duration: 0.3, ease: "easeOut" }}
+                        />
+                        <defs>
+                          <linearGradient id="progressGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                            <stop offset="0%" stopColor="#6366f1" />
+                            <stop offset="100%" stopColor="#22d3ee" />
+                          </linearGradient>
+                        </defs>
+                      </svg>
+                      {/* Percentage in center */}
+                      <div className="absolute inset-0 flex items-center justify-center">
+                        <span className="text-sm font-semibold text-white">{progress}%</span>
+                      </div>
                     </div>
-                    <div className="h-1.5 overflow-hidden rounded-full bg-white/10">
-                      <motion.div
-                        className="h-1.5 rounded-full bg-gradient-to-r from-indigo-500 to-cyan-400"
-                        initial={{ width: 0 }}
-                        animate={{ width: `${progress}%` }}
-                        transition={{ duration: 0.3, ease: "easeOut" }}
-                      />
+
+                    {/* File Name */}
+                    <div className="w-full text-center">
+                      <p className="truncate text-xs text-white/80" title={pullProgress.name}>
+                        {pullProgress.name}
+                      </p>
                     </div>
-                    <div className="flex items-center justify-between text-[10px] text-white/40">
+
+                    {/* Stats Row */}
+                    <div className="flex w-full justify-between text-[10px] text-white/40">
                       <span>
                         {formatFileSize(pullProgress.entry_received_bytes)} / {formatFileSize(pullProgress.entry_total_bytes)}
-                        {speedRef.current.speed > 0 && ` · ${formatFileSize(speedRef.current.speed)}/s`}
                       </span>
                       <span>
-                        {(() => {
-                          const remaining = pullProgress.entry_total_bytes - pullProgress.entry_received_bytes;
-                          const eta = speedRef.current.speed > 0 ? remaining / speedRef.current.speed : 0;
-                          return eta > 0 ? formatEta(eta) : "";
-                        })()}
+                        {speedRef.current.speed > 0 ? `${formatFileSize(speedRef.current.speed)}/s` : "计算中..."}
                       </span>
                     </div>
-                    <button
-                      className="w-full rounded border border-rose-500/30 bg-rose-500/10 py-1 text-[10px] text-rose-300 transition hover:bg-rose-500/20"
-                      onClick={async () => {
-                        try {
-                          await invoke("cancel_pull_command");
-                          setStatusType("info");
-                          setStatusMessage("已取消传输");
-                          setPullProgress(null);
-                          setPullingId(null);
-                          speedRef.current = { lastBytes: 0, lastTime: 0, speed: 0 };
-                        } catch { /* ignore */ }
-                      }}
-                    >
-                      取消传输
-                    </button>
+
+                    {/* ETA Row */}
+                    {speedRef.current.speed > 0 && (() => {
+                      const remaining = pullProgress.entry_total_bytes - pullProgress.entry_received_bytes;
+                      const eta = remaining / speedRef.current.speed;
+                      return eta > 0 ? (
+                        <div className="flex w-full items-center justify-center gap-1 text-[10px] text-white/30">
+                          <span>剩余时间</span>
+                          <span className="text-white/50">{formatEta(eta)}</span>
+                        </div>
+                      ) : null;
+                    })()}
+
+                    {/* Status Message */}
+                    {statusMessage && statusType === "info" && (
+                      <div className="w-full rounded-lg bg-indigo-500/10 px-2 py-1 text-center text-[10px] text-indigo-200/70">
+                        {statusMessage}
+                      </div>
+                    )}
                   </div>
                 ) : (
-                  <div className="text-center text-white/30">
-                    <p className="text-xs">空闲中</p>
+                  /* Idle State with History */
+                  <div className="flex flex-1 flex-col overflow-hidden">
+                    {/* Current Status */}
+                    {statusMessage ? (
+                      <div className={`shrink-0 px-3 py-2 text-[11px] ${
+                        statusType === "success"
+                          ? "bg-emerald-500/10 text-emerald-200 border-b border-emerald-500/20"
+                          : statusType === "error"
+                          ? "bg-rose-500/10 text-rose-200 border-b border-rose-500/20"
+                          : "bg-white/5 text-white/60"
+                      }`}>
+                        <div className="flex items-center gap-2">
+                          {statusType === "success" ? (
+                            <svg className="h-3 w-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                            </svg>
+                          ) : statusType === "error" ? (
+                            <svg className="h-3 w-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                            </svg>
+                          ) : null}
+                          <span className="truncate">{statusMessage}</span>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="shrink-0 px-3 py-2 text-[11px] text-white/40 bg-white/5 border-b border-white/10">
+                        <div className="flex items-center gap-2">
+                          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                          <span>等待传输</span>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Transfer History */}
+                    <div className="flex-1 overflow-y-auto p-2">
+                      {transferHistory.length > 0 ? (
+                        <div className="space-y-1">
+                          {transferHistory.slice(0, 10).map((item, idx) => (
+                            <div
+                              key={`${item.timestamp}-${idx}`}
+                              className="flex items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-white/5 transition"
+                            >
+                              <div className={`flex h-5 w-5 shrink-0 items-center justify-center rounded ${
+                                item.status === "success" ? "bg-emerald-500/20" : "bg-rose-500/20"
+                              }`}>
+                                {item.status === "success" ? (
+                                  <svg className="h-3 w-3 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                                  </svg>
+                                ) : (
+                                  <svg className="h-3 w-3 text-rose-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                                  </svg>
+                                )}
+                              </div>
+                              <div className="min-w-0 flex-1">
+                                <p className="truncate text-[10px] text-white/70">{item.name}</p>
+                                <p className="text-[9px] text-white/30">
+                                  {formatFileSize(item.size)} · {item.type === "pull" ? "接收" : "发送"}
+                                </p>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="flex h-full items-center justify-center">
+                          <div className="text-center text-white/20">
+                            <svg className="mx-auto h-6 w-6 opacity-50" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                            </svg>
+                            <p className="mt-2 text-[10px]">暂无传输记录</p>
+                          </div>
+                        </div>
+                      )}
+                    </div>
                   </div>
                 )}
               </div>
