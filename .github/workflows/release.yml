@@ -137,9 +137,20 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ github.ref_name }}"
-          EXE="src-tauri/target/release/SwiftShare.exe"
-          if [ -f "$EXE" ]; then
-            gh release upload "$TAG" "$EXE#SwiftShare_portable.exe" --clobber
+          # 便携包在 bundle/nsis/ 目录下，文件名包含版本和架构
+          PORTABLE=$(find src-tauri/target/release/bundle/nsis -name "*_portable.exe" 2>/dev/null | head -1)
+          if [ -n "$PORTABLE" ] && [ -f "$PORTABLE" ]; then
+            echo "Found portable exe: $PORTABLE"
+            gh release upload "$TAG" "$PORTABLE" --clobber
+            # 上传签名文件（用于自动更新）
+            if [ -f "${PORTABLE}.sig" ]; then
+              gh release upload "$TAG" "${PORTABLE}.sig" --clobber
+            fi
+          else
+            echo "Portable exe not found!"
+            echo "Available exe files in bundle:"
+            find src-tauri/target/release/bundle -name "*.exe" 2>/dev/null || echo "No exe files found"
+            exit 1
           fi
 
       - name: Upload artifacts (manual trigger)
