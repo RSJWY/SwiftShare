@@ -72,6 +72,30 @@ jobs:
       #     sudo apt-get update
       #     sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
+      - name: Extract version from tag
+        id: version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Update version in config files
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          echo "Updating version to $VERSION"
+          
+          # Update package.json
+          node -e "const fs=require('fs'); const pkg=JSON.parse(fs.readFileSync('package.json')); pkg.version='$VERSION'; fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2));"
+          
+          # Update tauri.conf.json
+          node -e "const fs=require('fs'); const cfg=JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json')); cfg.version='$VERSION'; fs.writeFileSync('src-tauri/tauri.conf.json', JSON.stringify(cfg, null, 2));"
+          
+          # Update Cargo.toml
+          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" src-tauri/Cargo.toml
+          
+          echo "Version updated to $VERSION in all config files"
+
       - name: Install frontend dependencies
         run: pnpm install
 
