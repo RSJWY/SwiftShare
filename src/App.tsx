@@ -90,6 +90,7 @@ const SETTINGS_STORE_PATH = "settings.json";
 
 function App() {
   const [appVersion, setAppVersion] = useState<string>("");
+  const [isPortable, setIsPortable] = useState<boolean>(false);
   const [devices, setDevices] = useState<DeviceInfo[]>([]);
   const [activeDevice, setActiveDevice] = useState<DeviceInfo | null>(null);
   const [progress, setProgress] = useState(0);
@@ -215,6 +216,12 @@ function App() {
       .catch((err) => {
         console.warn("Failed to get app version:", err);
         setAppVersion("");
+      });
+    invoke<boolean>("is_portable_mode_command")
+      .then(setIsPortable)
+      .catch((err) => {
+        console.warn("Failed to get portable mode:", err);
+        setIsPortable(false);
       });
   }, []);
 
@@ -517,11 +524,11 @@ return (
             <div>
               <div className="flex items-center gap-2">
                 <p className="text-xs uppercase tracking-[0.3em] text-indigo-200/70">SwiftShare</p>
-                {appVersion && (
-                  <span className="rounded bg-indigo-500/30 px-1.5 py-0.5 text-[10px] text-indigo-200/80">
-                    v{appVersion}
-                  </span>
-                )}
+{appVersion && (
+  <span className="rounded bg-indigo-500/30 px-1.5 py-0.5 text-[10px] text-indigo-200/80">
+    v{appVersion}{isPortable ? "-P" : ""}
+  </span>
+)}
               </div>
               <h1 className="text-xl font-semibold text-white">局域网文件共享</h1>
             </div>
