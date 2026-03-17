@@ -3,6 +3,7 @@ use local_ip_address::{list_afinet_netifas, local_ip};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::io::Write;
 use std::net::IpAddr;
 use std::net::TcpStream as StdTcpStream;
 use std::thread;
@@ -11,6 +12,7 @@ use tauri::{AppHandle, Emitter};
 
 const SERVICE_TYPE: &str = "_swiftshare._tcp.local.";
 const DISCOVER_INTERVAL_MS: u64 = 2000;
+const HEARTBEAT_INTERVAL_MS: u64 = 5000;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DeviceInfo {
@@ -165,6 +167,7 @@ pub fn start(
         let mut services: HashMap<String, (Vec<IpAddr>, String, u16, String)> = HashMap::new();
         let mut last_emit = std::time::Instant::now();
         let mut last_probe = std::time::Instant::now();
+        let mut last_heartbeat = std::time::Instant::now();
 
         // Helper: sync known_devices from services
         let sync_known = |svcs: &HashMap<String, (Vec<IpAddr>, String, u16, String)>| {
@@ -248,6 +251,16 @@ pub fn start(
                 Err(_) => {
                     // Timeout — fall through to probe
                 }
+            }
+
+            // TCP heartbeat every 5s: connect to each known device to punch through firewalls
+            if last_heartbeat.elapsed().as_millis() >= HEARTBEAT_INTERVAL_MS as u128 {
+                for (addrs, _mid, port, _name) in services.values() {
+                    for addr in addrs {
+                        send_heartbeat(addr.to_string(), *port);
+                    }
+                }
+                last_heartbeat = std::time::Instant::now();
             }
 
             // Active probe every 5s: TCP connect to each known device, remove unreachable ones
@@ -416,12 +429,41 @@ fn is_loopback(addr: &IpAddr) -> bool {
 
 fn is_virtual_interface(name: &str) -> bool {
     let lowered = name.to_lowercase();
-    let patterns = [
-        "virtual", "vmware", "hyper-v", "vbox", "virtualbox",
+    // 排除虚拟网卡，但保留桥接网卡（如 Hyper-V 虚拟交换机的桥接）
+    // 虚拟网卡特征：veth, docker, wsl, tap, tun, hamachi, zerotier, loopback, npf
+    // 保留：以太网、WiFi、Ethernet、WLAN、Intel、Realtek、Broadcom 等真实网卡
+    let virtual_patterns = [
         "veth", "docker", "wsl", "tap", "tun",
         "hamachi", "zerotier", "loopback", "npf",
     ];
-    patterns.iter().any(|p| lowered.contains(p))
+
+    // 检查是否是虚拟网卡
+    if virtual_patterns.iter().any(|p| lowered.contains(p)) {
+        return true;
+    }
+
+    // VMware 和 VirtualBox 的虚拟网卡通常有特定的 MAC 前缀或名称
+    // 但桥接模式下会使用真实网卡，所以这里不过滤
+    // 只过滤明确的虚拟网卡名称
+    if lowered.contains("virtual") && !lowered.contains("ethernet") {
+        return true;
+    }
+
+    false
+}
+
+/// Send a heartbeat packet to help devices behind firewalls be discovered
+fn send_heartbeat(target_ip: String, target_port: u16) {
+    let addr = format!("{}:{}", target_ip, target_port);
+    if let Ok(socket_addr) = addr.parse::<std::net::SocketAddr>() {
+        if let Ok(mut stream) = StdTcpStream::connect_timeout(&socket_addr, Duration::from_millis(200)) {
+            // Send heartbeat packet: MAGIC + PacketType::Heartbeat + zeros
+            let mut packet = vec![0u8; 24];
+            packet[0..4].copy_from_slice(b"SWFT");
+            packet[4..6].copy_from_slice(&(16u16).to_be_bytes()); // PacketType::Heartbeat = 16
+            let _ = stream.write_all(&packet);
+        }
+    }
 }
 
 fn extract_machine_and_hostname(fullname: &str) -> (String, String) {

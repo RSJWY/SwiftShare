@@ -133,6 +133,8 @@ enum PacketType {
     PullInline = 14,
     /// Directory file, small enough to inline. Same layout as PullInline.
     DirFileInline = 15,
+    /// Heartbeat packet for firewall traversal - helps devices behind firewalls be discovered
+    Heartbeat = 16,
 }
 
 pub async fn start_transfer(
@@ -472,6 +474,11 @@ async fn handle_connection(peer_key: String, pool: ConnectionPool, shared: Share
             } else { vec![] };
             let json = serde_json::to_vec(&file_list).unwrap_or_default();
             write_packet(&mut stream, PacketType::DirListResponse, 0, &json).await?;
+        } else if packet_type == PacketType::Heartbeat as u16 {
+            // Heartbeat packet - just acknowledge and continue
+            // This helps devices behind firewalls be discovered by allowing
+            // the firewall to establish a bidirectional connection
+            let _ = write_packet(&mut stream, PacketType::Heartbeat, 0, &[]).await;
         } else if packet_type == PacketType::Goodbye as u16 {
             break;
         } else {

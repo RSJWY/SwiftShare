@@ -10,7 +10,17 @@
       "Bash(ls -lh \"D:\\\\Other\\\\SwiftShare\"/src-tauri/src/*.rs \"D:\\\\Other\\\\SwiftShare\"/src/*.tsx \"D:\\\\Other\\\\SwiftShare\"/src/*.css \"D:\\\\Other\\\\SwiftShare\"/src-tauri/tauri.conf.json \"D:\\\\Other\\\\SwiftShare\"/package.json \"D:\\\\Other\\\\SwiftShare\"/src-tauri/Cargo.toml)",
       "Bash(find D:\\\\Other\\\\SwiftShare:*)",
       "Bash(ls -lh \"D:\\\\Other\\\\SwiftShare\"/src-tauri/src/*.rs \"D:\\\\Other\\\\SwiftShare\"/src/*.tsx \"D:\\\\Other\\\\SwiftShare\"/src/*.ts \"D:\\\\Other\\\\SwiftShare\"/src/*.css)",
-      "Bash(git push:*)"
+      "Bash(git push:*)",
+      "Bash(/tmp/fix_transport.py:*)",
+      "WebSearch",
+      "Bash(pnpm add:*)",
+      "Bash(pnpm build:*)",
+      "Bash(pnpm tauri:*)",
+      "Bash(printf \\\\n\\\\n:*)",
+      "Bash(gh auth:*)",
+      "Bash(python3:*)",
+      "Bash(powershell:*)",
+      "Bash(npx tauri:*)"
     ]
   }
 }
