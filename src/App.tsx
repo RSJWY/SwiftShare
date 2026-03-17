@@ -87,6 +87,7 @@ function formatEta(seconds: number): string {
 const SETTINGS_STORE_PATH = "settings.json";
 
 function App() {
+  const [appVersion, setAppVersion] = useState<string>("");
   const [devices, setDevices] = useState<DeviceInfo[]>([]);
   const [activeDevice, setActiveDevice] = useState<DeviceInfo | null>(null);
   const [progress, setProgress] = useState(0);
@@ -202,6 +203,12 @@ function App() {
       .catch((err) => {
         console.warn("Failed to get local port:", err);
         setLocalPort(0);
+      });
+    invoke<string>("get_app_version_command")
+      .then(setAppVersion)
+      .catch((err) => {
+        console.warn("Failed to get app version:", err);
+        setAppVersion("");
       });
   }, []);
 
@@ -500,7 +507,14 @@ return (
         <header className="flex items-center justify-between">
           <div className="flex items-center gap-4">
             <div>
-              <p className="text-xs uppercase tracking-[0.3em] text-indigo-200/70">SwiftShare</p>
+              <div className="flex items-center gap-2">
+                <p className="text-xs uppercase tracking-[0.3em] text-indigo-200/70">SwiftShare</p>
+                {appVersion && (
+                  <span className="rounded bg-indigo-500/30 px-1.5 py-0.5 text-[10px] text-indigo-200/80">
+                    v{appVersion}
+                  </span>
+                )}
+              </div>
               <h1 className="text-xl font-semibold text-white">局域网文件共享</h1>
             </div>
             <div className="flex items-center gap-2 text-xs text-white/50">
@@ -1142,7 +1156,7 @@ return (
       )}
 
       {conflictInfo && (
-        <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/50 backdrop-blur-sm">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
           <div className="glass-panel w-full max-w-md p-6">
             <h2 className="text-lg font-semibold text-white">文件冲突</h2>
             <p className="mt-3 text-sm text-white/70">
@@ -1184,8 +1198,8 @@ return (
       )}
 
       {settingsOpen && (
-        <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/50 backdrop-blur-sm">
-          <div className="glass-panel w-full max-w-xl p-6">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
+          <div className="glass-panel w-full max-w-xl max-h-[90vh] overflow-y-auto p-6 mx-4">
             <div className="flex items-center justify-between">
               <h2 className="text-lg font-semibold text-white">设置</h2>
               <button

@@ -311,6 +311,11 @@ fn is_portable_mode_command() -> bool {
     false
 }
 
+#[tauri::command]
+fn get_app_version_command() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
 static TRANSPORT_HANDLE: std::sync::OnceLock<Arc<Mutex<Option<TransportHandle>>>> = std::sync::OnceLock::new();
 static SETTINGS_STATE: std::sync::OnceLock<Arc<SettingsState>> = std::sync::OnceLock::new();
 static DISCOVERY_HANDLE: std::sync::OnceLock<Arc<Mutex<Option<discovery::DiscoveryHandle>>>> = std::sync::OnceLock::new();
@@ -411,7 +416,8 @@ pub fn run() {
             notify_offline_command,
             refresh_discovery_command,
             update_settings_command,
-            is_portable_mode_command
+            is_portable_mode_command,
+            get_app_version_command
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
