@@ -20,9 +20,10 @@ export async function checkForAppUpdates(userInitiated: boolean) {
 
     if (update?.available) {
       const portable = await isPortableMode();
+      // 便携版：只提供前往下载选项
       if (portable) {
         const yes = await ask(
-          `发现新版本 ${update.version}。便携版不支持自动更新，是否前往下载页面？\n\n更新内容：\n${update.body ?? "无"}`,
+          `发现新版本 ${update.version}，是否前往下载页面？\n\n更新内容：\n${update.body ?? "无"}`,
           {
             title: "SwiftShare 更新",
             kind: "info",
@@ -34,19 +35,24 @@ export async function checkForAppUpdates(userInitiated: boolean) {
           await open(RELEASES_URL);
         }
       } else {
+        // 安装版：提供"更新"和"手动下载"两个选项
         const yes = await ask(
-          `发现新版本 ${update.version}，是否立即更新？\n\n更新内容：\n${update.body ?? "无"}`,
+          `发现新版本 ${update.version}\n\n更新内容：\n${update.body ?? "无"}\n\n点击「更新」自动下载安装，或点击「手动下载」前往 GitHub 下载。`,
           {
             title: "SwiftShare 更新",
             kind: "info",
             okLabel: "更新",
-            cancelLabel: "稍后",
+            cancelLabel: "手动下载",
           },
         );
 
         if (yes) {
+          // 用户选择自动更新
           await update.downloadAndInstall();
           await relaunch();
+        } else {
+          // 用户选择手动下载
+          await open(RELEASES_URL);
         }
       }
     } else if (userInitiated) {
