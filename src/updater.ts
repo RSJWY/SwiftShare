@@ -5,6 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-shell";
 
 const RELEASES_URL = "https://github.com/RSJWY/SwiftShare/releases";
+const DEFAULT_MIRROR = "https://ghfast.top/";
 
 async function isPortableMode(): Promise<boolean> {
   try {
@@ -14,9 +15,45 @@ async function isPortableMode(): Promise<boolean> {
   }
 }
 
-export async function checkForAppUpdates(userInitiated: boolean) {
+export async function checkForAppUpdates(
+  userInitiated: boolean,
+  options?: { mirrorUrl?: string; onChecking?: (checking: boolean) => void }
+) {
   try {
-    const update = await check();
+    // 通知开始检测
+    options?.onChecking?.(true);
+
+    // 使用镜像地址包装 check 函数
+    const mirrorUrl = options?.mirrorUrl || DEFAULT_MIRROR;
+    
+    // 暂时修改 endpoint 使用镜像
+    const originalFetch = window.fetch;
+    const checkWithMirror = async () => {
+      if (mirrorUrl) {
+        // 劫持 fetch 来重写 URL
+        window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = input.toString();
+          // 只重写 GitHub 相关的请求
+          if (url.includes('github.com') && !url.includes(mirrorUrl)) {
+            const newUrl = url.replace(/^https:\/\/github\.com/, mirrorUrl.replace(/\/$/, ''));
+            return originalFetch(newUrl, init);
+          }
+          return originalFetch(input, init);
+        };
+      }
+      
+      try {
+        return await check();
+      } finally {
+        // 恢复原始 fetch
+        window.fetch = originalFetch;
+      }
+    };
+
+    const update = await checkWithMirror();
+
+    // 通知检测完成
+    options?.onChecking?.(false);
 
     if (update?.available) {
       const portable = await isPortableMode();
@@ -64,6 +101,9 @@ export async function checkForAppUpdates(userInitiated: boolean) {
       });
     }
   } catch (e) {
+    // 通知检测完成（即使出错）
+    options?.onChecking?.(false);
+    
     if (userInitiated) {
       await ask(`检查更新失败：${e}`, {
         title: "SwiftShare 更新",

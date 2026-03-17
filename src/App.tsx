@@ -53,6 +53,7 @@ type Settings = {
   maxMbps: number;
   discoveryIntervalMs: number;
   sameSubnetOnly: boolean;
+  updateMirror: string;
 };
 
 const DEFAULT_SETTINGS: Settings = {
@@ -61,6 +62,7 @@ const DEFAULT_SETTINGS: Settings = {
   maxMbps: 0,
   discoveryIntervalMs: 5000,
   sameSubnetOnly: false,
+  updateMirror: "https://ghfast.top/",
 };
 
 // Format file size to human-readable format
@@ -119,6 +121,8 @@ function App() {
   const conflictCallbackRef = useRef<(() => void) | null>(null);
   // Exit feedback state
   const [isClosing, setIsClosing] = useState(false);
+  // Update checking state
+  const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
 
   // Build a virtual tree node list for browsing.
   // Returns { name, isDir, entry? } for each visible item at the given path.
@@ -1232,12 +1236,38 @@ return (
                     <p className="text-xs text-white/50">检查是否有新版本可用</p>
                   </div>
                   <button
-                    className="subtle-button"
+                    className="subtle-button flex items-center gap-2"
                     type="button"
-                    onClick={() => checkForAppUpdates(true)}
+                    disabled={isCheckingUpdate}
+                    onClick={() =>
+                      checkForAppUpdates(true, {
+                        mirrorUrl: settings.updateMirror,
+                        onChecking: setIsCheckingUpdate,
+                      })
+                    }
                   >
+                    {isCheckingUpdate && (
+                      <span className="h-3 w-3 animate-spin rounded-full border-2 border-white/30 border-t-white" />
+                    )}
                     检查更新
                   </button>
+                </div>
+
+                <div className="glass-card p-4">
+                  <label className="text-xs text-white/60">更新镜像地址</label>
+                  <input
+                    className="mt-2 w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-white"
+                    type="text"
+                    placeholder="https://ghfast.top/"
+                    value={settings.updateMirror}
+                    onChange={(event) =>
+                      setSettings((prev) => ({
+                        ...prev,
+                        updateMirror: event.target.value,
+                      }))
+                    }
+                  />
+                  <p className="mt-1 text-[10px] text-white/40">用于加速 GitHub 访问，留空则直连</p>
                 </div>
 
                 <div className="glass-card p-4">
