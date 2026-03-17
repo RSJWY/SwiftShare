@@ -117,6 +117,8 @@ function App() {
   // Conflict dialog state
   const [conflictInfo, setConflictInfo] = useState<ConflictInfo | null>(null);
   const conflictCallbackRef = useRef<(() => void) | null>(null);
+  // Exit feedback state
+  const [isClosing, setIsClosing] = useState(false);
 
   // Build a virtual tree node list for browsing.
   // Returns { name, isDir, entry? } for each visible item at the given path.
@@ -238,6 +240,8 @@ function App() {
       unlisten = await win.onCloseRequested(async (event) => {
         // 阻止默认关闭行为
         event.preventDefault();
+        // 显示退出反馈
+        setIsClosing(true);
         try {
           await invoke("notify_offline_command");
         } catch {
@@ -1338,6 +1342,16 @@ return (
                 </div>
               </form>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* Exit Feedback Overlay */}
+      {isClosing && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 backdrop-blur-sm">
+          <div className="flex flex-col items-center gap-4">
+            <div className="h-8 w-8 animate-spin rounded-full border-2 border-white/20 border-t-white/80" />
+            <p className="text-sm text-white/80">正在退出...</p>
           </div>
         </div>
       )}
