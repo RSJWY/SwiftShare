@@ -89,17 +89,9 @@ async function getCurrentVersion(): Promise<string> {
 }
 
 /**
- * 构建下载页面 URL（支持镜像）
- * 镜像格式：{mirror}{original_url}
- * 例如：https://ghfast.top/https://github.com/RSJWY/SwiftShare/releases
+ * 导出 Releases 页面 URL 供设置页使用
  */
-function buildDownloadPageUrl(mirrorUrl: string): string {
-  if (mirrorUrl && mirrorUrl.trim() !== "") {
-    const mirror = mirrorUrl.trim().replace(/\/$/, "");
-    return `${mirror}/${GITHUB_RELEASES_PAGE}`;
-  }
-  return GITHUB_RELEASES_PAGE;
-}
+export const RELEASES_PAGE_URL = GITHUB_RELEASES_PAGE;
 
 export async function checkForAppUpdates(
   userInitiated: boolean,
@@ -147,7 +139,6 @@ export async function checkForAppUpdates(
 
     // 有新版本可用
     console.log(`[Updater] New version available: ${updateInfo.version}`);
-    const downloadUrl = buildDownloadPageUrl(mirrorUrl);
 
     // 显示更新提示（便携版和安装版统一处理）
     const message = `发现新版本 ${updateInfo.version}\n\n更新内容：\n${updateInfo.body ?? "无"}`;
@@ -159,7 +150,8 @@ export async function checkForAppUpdates(
     });
 
     if (yes) {
-      await open(downloadUrl);
+      // 直接跳转到 GitHub Releases 页面
+      await open(GITHUB_RELEASES_PAGE);
     }
     // 用户点击"稍后"或叉号：直接关闭，不跳转
   } catch (e) {

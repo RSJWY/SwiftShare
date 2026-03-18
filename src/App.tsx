@@ -3,7 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { Store } from "@tauri-apps/plugin-store";
 import { startDrag } from "@crabnebula/tauri-plugin-drag";
 import { motion } from "framer-motion";
@@ -462,16 +463,16 @@ function App() {
     };
   }, [addSharedFiles]);
 
-  const chooseDownloadDir = async () => {
-    const folder = await open({
-      directory: true,
-      multiple: false,
-    });
-    if (typeof folder === "string") {
-      setSettings((prev) => ({ ...prev, downloadDir: folder }));
-      setDownloadDir(folder);
-    }
-  };
+const chooseDownloadDir = async () => {
+  const folder = await openDialog({
+    directory: true,
+    multiple: false,
+  });
+  if (typeof folder === "string") {
+    setSettings((prev) => ({ ...prev, downloadDir: folder }));
+    setDownloadDir(folder);
+  }
+};
 
   const saveSettings = async (next: Settings) => {
     const store = await Store.load(SETTINGS_STORE_PATH);
@@ -933,14 +934,14 @@ return (
                               <button
                                 className="shrink-0 rounded border border-white/10 bg-white/5 px-2 py-1 text-[10px] text-white/70 transition hover:bg-white/10 disabled:opacity-50"
                                 onClick={async () => {
-                                  let dir = downloadDir;
-                                  if (!dir) {
-                                    const folder = await open({ directory: true, multiple: false });
-                                    if (typeof folder !== "string") return;
-                                    setSettings(prev => ({ ...prev, downloadDir: folder }));
-                                    setDownloadDir(folder);
-                                    dir = folder;
-                                  }
+                                let dir = downloadDir;
+                                if (!dir) {
+                                  const folder = await openDialog({ directory: true, multiple: false });
+                                  if (typeof folder !== "string") return;
+                                  setSettings(prev => ({ ...prev, downloadDir: folder }));
+                                  setDownloadDir(folder);
+                                  dir = folder;
+                                }
                                   if (node.entry) {
                                     const doPull = async () => {
                                       const entryName = node.entry!.name;
@@ -1021,7 +1022,7 @@ return (
                               onClick={async () => {
                                 let dir = downloadDir;
                                 if (!dir) {
-                                  const folder = await open({ directory: true, multiple: false });
+                                  const folder = await openDialog({ directory: true, multiple: false });
                                   if (typeof folder !== "string") return;
                                   setSettings(prev => ({ ...prev, downloadDir: folder }));
                                   setDownloadDir(folder);
@@ -1400,11 +1401,19 @@ return (
                   setSettingsOpen(false);
                 }}
               >
-                <div className="glass-card flex items-center justify-between p-4">
-                  <div>
-                    <p className="text-sm text-white">检查更新</p>
-                    <p className="text-xs text-white/50">检查是否有新版本可用</p>
-                  </div>
+              <div className="glass-card flex items-center justify-between p-4">
+                <div>
+                  <p className="text-sm text-white">检查更新</p>
+                  <p className="text-xs text-white/50">检查是否有新版本可用</p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    className="text-xs text-indigo-400 hover:text-indigo-300 transition"
+                    onClick={() => openUrl("https://github.com/RSJWY/SwiftShare/releases")}
+                  >
+                    GitHub 发布页
+                  </button>
                   <button
                     className="subtle-button flex items-center gap-2"
                     type="button"
@@ -1422,6 +1431,7 @@ return (
                     检查更新
                   </button>
                 </div>
+              </div>
 
                 <div className="glass-card p-4">
                   <label className="text-xs text-white/60">更新镜像地址</label>
