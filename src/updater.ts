@@ -4,7 +4,8 @@ import { open } from "@tauri-apps/plugin-shell";
 import { fetch } from "@tauri-apps/plugin-http";
 
 const DEFAULT_MIRROR = "https://ghfast.top/";
-const LATEST_JSON_PATH = "RSJWY/SwiftShare/releases/latest/download/latest.json";
+const GITHUB_LATEST_JSON = "https://github.com/RSJWY/SwiftShare/releases/latest/download/latest.json";
+const GITHUB_RELEASES_PAGE = "https://github.com/RSJWY/SwiftShare/releases";
 
 interface UpdateInfo {
   version: string;
@@ -14,17 +15,19 @@ interface UpdateInfo {
 
 /**
  * 从镜像或原始 URL 获取 latest.json
+ * 镜像格式：{mirror}{original_url}
+ * 例如：https://ghfast.top/https://github.com/RSJWY/SwiftShare/releases/latest/download/latest.json
  */
 async function fetchLatestJson(mirrorUrl: string): Promise<UpdateInfo | null> {
-  // 构建请求 URL
+  // 构建请求 URL：镜像前缀 + 原始完整 URL
   let jsonUrl: string;
   if (mirrorUrl && mirrorUrl.trim() !== "") {
-    // 使用镜像地址
-    const mirror = mirrorUrl.replace(/\/$/, "");
-    jsonUrl = `https://${mirror}/${LATEST_JSON_PATH}`;
+    // 使用镜像地址：{mirror}{original_url}
+    const mirror = mirrorUrl.trim().replace(/\/$/, "");
+    jsonUrl = `${mirror}/${GITHUB_LATEST_JSON}`;
   } else {
     // 直接访问 GitHub
-    jsonUrl = `https://github.com/${LATEST_JSON_PATH}`;
+    jsonUrl = GITHUB_LATEST_JSON;
   }
 
   console.log(`[Updater] Checking for updates at: ${jsonUrl}`);
@@ -87,13 +90,15 @@ async function getCurrentVersion(): Promise<string> {
 
 /**
  * 构建下载页面 URL（支持镜像）
+ * 镜像格式：{mirror}{original_url}
+ * 例如：https://ghfast.top/https://github.com/RSJWY/SwiftShare/releases
  */
 function buildDownloadPageUrl(mirrorUrl: string): string {
   if (mirrorUrl && mirrorUrl.trim() !== "") {
-    const mirror = mirrorUrl.replace(/\/$/, "");
-    return `https://${mirror}/RSJWY/SwiftShare/releases`;
+    const mirror = mirrorUrl.trim().replace(/\/$/, "");
+    return `${mirror}/${GITHUB_RELEASES_PAGE}`;
   }
-  return "https://github.com/RSJWY/SwiftShare/releases";
+  return GITHUB_RELEASES_PAGE;
 }
 
 export async function checkForAppUpdates(
