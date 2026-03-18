@@ -233,13 +233,14 @@ function App() {
       });
   }, []);
 
-  // Auto-check for updates 3 seconds after startup
+  // Auto-check for updates 3 seconds after startup (after settings are loaded)
   useEffect(() => {
+    if (settingsLoading) return; // Wait for settings to load
     const timer = setTimeout(() => {
-      checkForAppUpdates(false);
+      checkForAppUpdates(false, { mirrorUrl: settings.updateMirror });
     }, 3000);
     return () => clearTimeout(timer);
-  }, []);
+  }, [settingsLoading, settings.updateMirror]);
 
   useEffect(() => {
     const unlistenPromise = listen<DeviceInfo[]>("device-list-updated", (event) => {
@@ -261,11 +262,21 @@ function App() {
         event.preventDefault();
         // 显示退出反馈
         setIsClosing(true);
+        
+        // 尝试通知离线，但设置超时（最多等待 2 秒）
+        // 用户可以通过再次点击关闭按钮强制退出
         try {
-          await invoke("notify_offline_command");
+          const timeoutPromise = new Promise<void>((_, reject) => 
+            setTimeout(() => reject(new Error("timeout")), 2000)
+          );
+          await Promise.race([
+            invoke("notify_offline_command"),
+            timeoutPromise
+          ]);
         } catch {
-          // ignore
+          // 超时或失败，忽略
         }
+        
         // 使用 destroy() 强制关闭窗口，避免递归触发 onCloseRequested
         await win.destroy();
       });
@@ -1541,6 +1552,16 @@ return (
           <div className="flex flex-col items-center gap-4">
             <div className="h-8 w-8 animate-spin rounded-full border-2 border-white/20 border-t-white/80" />
             <p className="text-sm text-white/80">正在退出...</p>
+            <p className="text-xs text-white/40">正在通知其他设备</p>
+            <button
+              className="mt-2 rounded-lg bg-white/10 px-4 py-2 text-xs text-white/70 transition hover:bg-white/20"
+              onClick={async () => {
+                const win = getCurrentWebviewWindow();
+                await win.destroy();
+              }}
+            >
+              强制退出
+            </button>
           </div>
         </div>
       )}

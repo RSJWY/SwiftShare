@@ -207,10 +207,16 @@ pub async fn start_transfer(
 }
 
 pub async fn send_goodbye(target_ip: String, target_port: u16) {
-    let addr = format!("{}:{}", target_ip, target_port);
-    if let Ok(mut stream) = TcpStream::connect(&addr).await {
-        let _ = write_packet(&mut stream, PacketType::Goodbye, 0, &[]).await;
-    }
+  let addr = format!("{}:{}", target_ip, target_port);
+  // Use tokio::time::timeout to avoid hanging on unreachable devices
+  let result = tokio::time::timeout(
+    Duration::from_millis(500),
+    TcpStream::connect(&addr)
+  ).await;
+  
+  if let Ok(Ok(mut stream)) = result {
+    let _ = write_packet(&mut stream, PacketType::Goodbye, 0, &[]).await;
+  }
 }
 
 pub async fn start_listener(port: Option<u16>) -> Result<TransportHandle> {

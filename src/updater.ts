@@ -1,6 +1,6 @@
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
-import { ask } from "@tauri-apps/plugin-dialog";
+import { ask, confirm } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-shell";
 
@@ -57,13 +57,12 @@ export async function checkForAppUpdates(
 
     if (update?.available) {
       const portable = await isPortableMode();
-      // 便携版：只提供前往下载选项
+      // 便携版：使用 confirm，"确定"前往下载，"取消"关闭对话框
       if (portable) {
-        const yes = await ask(
+        const yes = await confirm(
           `发现新版本 ${update.version}，是否前往下载页面？\n\n更新内容：\n${update.body ?? "无"}`,
           {
             title: "SwiftShare 更新",
-            kind: "info",
             okLabel: "前往下载",
             cancelLabel: "稍后",
           },
@@ -71,26 +70,41 @@ export async function checkForAppUpdates(
         if (yes) {
           await open(RELEASES_URL);
         }
+        // 用户点击"稍后"或叉号：直接关闭，不跳转
       } else {
-        // 安装版：提供"更新"和"手动下载"两个选项
-        const yes = await ask(
-          `发现新版本 ${update.version}\n\n更新内容：\n${update.body ?? "无"}\n\n点击「更新」自动下载安装，或点击「手动下载」前往 GitHub 下载。`,
+        // 安装版：使用 ask 提供三个选项
+        // ask 返回 true 表示点击 okLabel，false 表示点击 cancelLabel
+        const shouldUpdate = await ask(
+          `发现新版本 ${update.version}\n\n更新内容：\n${update.body ?? "无"}`,
           {
             title: "SwiftShare 更新",
             kind: "info",
             okLabel: "更新",
-            cancelLabel: "手动下载",
+            cancelLabel: "关闭",
           },
         );
 
-        if (yes) {
+        if (shouldUpdate) {
           // 用户选择自动更新
-          await update.downloadAndInstall();
-          await relaunch();
-        } else {
-          // 用户选择手动下载
-          await open(RELEASES_URL);
+          // 询问是否在更新失败时手动下载
+          try {
+            await update.downloadAndInstall();
+            await relaunch();
+          } catch (installError) {
+            const manualDownload = await confirm(
+              `自动更新失败：${installError}\n\n是否前往 GitHub 手动下载？`,
+              {
+                title: "更新失败",
+                okLabel: "前往下载",
+                cancelLabel: "取消",
+              },
+            );
+            if (manualDownload) {
+              await open(RELEASES_URL);
+            }
+          }
         }
+        // 用户点击"关闭"或叉号：直接关闭，不跳转
       }
     } else if (userInitiated) {
       await ask("当前已是最新版本。", {
