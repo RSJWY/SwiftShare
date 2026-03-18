@@ -15,6 +15,9 @@
     "updater:default",
     "process:allow-restart",
     "shell:allow-open",
-    "dialog:allow-ask"
+    "dialog:allow-ask",
+    "http:default",
+    "http:allow-fetch",
+    "core:app:allow-version"
   ]
 }

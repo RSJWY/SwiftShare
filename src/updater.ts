@@ -1,18 +1,99 @@
-import { check } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/plugin-process";
 import { ask, confirm } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-shell";
+import { fetch } from "@tauri-apps/plugin-http";
 
-const RELEASES_URL = "https://github.com/RSJWY/SwiftShare/releases";
 const DEFAULT_MIRROR = "https://ghfast.top/";
+const LATEST_JSON_PATH = "RSJWY/SwiftShare/releases/latest/download/latest.json";
 
-async function isPortableMode(): Promise<boolean> {
-  try {
-    return await invoke<boolean>("is_portable_mode_command");
-  } catch {
-    return false;
+interface UpdateInfo {
+  version: string;
+  date?: string;
+  body?: string;
+}
+
+/**
+ * 从镜像或原始 URL 获取 latest.json
+ */
+async function fetchLatestJson(mirrorUrl: string): Promise<UpdateInfo | null> {
+  // 构建请求 URL
+  let jsonUrl: string;
+  if (mirrorUrl && mirrorUrl.trim() !== "") {
+    // 使用镜像地址
+    const mirror = mirrorUrl.replace(/\/$/, "");
+    jsonUrl = `https://${mirror}/${LATEST_JSON_PATH}`;
+  } else {
+    // 直接访问 GitHub
+    jsonUrl = `https://github.com/${LATEST_JSON_PATH}`;
   }
+
+  console.log(`[Updater] Checking for updates at: ${jsonUrl}`);
+
+  try {
+    const response = await fetch(jsonUrl, {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+      },
+    });
+
+    if (!response.ok) {
+      console.error(`[Updater] HTTP error: ${response.status}`);
+      return null;
+    }
+
+    const data = await response.json();
+    console.log("[Updater] Received update info:", data);
+
+    return {
+      version: data.version,
+      date: data.pub_date,
+      body: data.notes,
+    };
+  } catch (e) {
+    console.error("[Updater] Failed to fetch latest.json:", e);
+    return null;
+  }
+}
+
+/**
+ * 比较版本号，返回 true 表示 newVersion > currentVersion
+ */
+function isNewerVersion(newVersion: string, currentVersion: string): boolean {
+  const parseVersion = (v: string) => v.split(".").map((n) => parseInt(n, 10) || 0);
+  const newParts = parseVersion(newVersion);
+  const currentParts = parseVersion(currentVersion);
+
+  for (let i = 0; i < Math.max(newParts.length, currentParts.length); i++) {
+    const newPart = newParts[i] || 0;
+    const currentPart = currentParts[i] || 0;
+    if (newPart > currentPart) return true;
+    if (newPart < currentPart) return false;
+  }
+  return false; // 版本相同
+}
+
+/**
+ * 获取当前应用版本
+ */
+async function getCurrentVersion(): Promise<string> {
+  try {
+    const { getVersion } = await import("@tauri-apps/api/app");
+    return await getVersion();
+  } catch {
+    return await invoke<string>("get_app_version_command");
+  }
+}
+
+/**
+ * 构建下载页面 URL（支持镜像）
+ */
+function buildDownloadPageUrl(mirrorUrl: string): string {
+  if (mirrorUrl && mirrorUrl.trim() !== "") {
+    const mirror = mirrorUrl.replace(/\/$/, "");
+    return `https://${mirror}/RSJWY/SwiftShare/releases`;
+  }
+  return "https://github.com/RSJWY/SwiftShare/releases";
 }
 
 export async function checkForAppUpdates(
@@ -23,101 +104,65 @@ export async function checkForAppUpdates(
     // 通知开始检测
     options?.onChecking?.(true);
 
-    // 使用镜像地址包装 check 函数
     const mirrorUrl = options?.mirrorUrl || DEFAULT_MIRROR;
-    
-    // 暂时修改 endpoint 使用镜像
-    const originalFetch = window.fetch;
-    const checkWithMirror = async () => {
-      if (mirrorUrl) {
-        // 劫持 fetch 来重写 URL
-        window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
-          const url = input.toString();
-          // 只重写 GitHub 相关的请求
-          if (url.includes('github.com') && !url.includes(mirrorUrl)) {
-            const newUrl = url.replace(/^https:\/\/github\.com/, mirrorUrl.replace(/\/$/, ''));
-            return originalFetch(newUrl, init);
-          }
-          return originalFetch(input, init);
-        };
-      }
-      
-      try {
-        return await check();
-      } finally {
-        // 恢复原始 fetch
-        window.fetch = originalFetch;
-      }
-    };
+    const currentVersion = await getCurrentVersion();
 
-    const update = await checkWithMirror();
+    console.log(`[Updater] Current version: ${currentVersion}, Mirror: ${mirrorUrl}`);
+
+    // 从镜像获取更新信息
+    const updateInfo = await fetchLatestJson(mirrorUrl);
 
     // 通知检测完成
     options?.onChecking?.(false);
 
-    if (update?.available) {
-      const portable = await isPortableMode();
-      // 便携版：使用 confirm，"确定"前往下载，"取消"关闭对话框
-      if (portable) {
-        const yes = await confirm(
-          `发现新版本 ${update.version}，是否前往下载页面？\n\n更新内容：\n${update.body ?? "无"}`,
-          {
-            title: "SwiftShare 更新",
-            okLabel: "前往下载",
-            cancelLabel: "稍后",
-          },
-        );
-        if (yes) {
-          await open(RELEASES_URL);
-        }
-        // 用户点击"稍后"或叉号：直接关闭，不跳转
-      } else {
-        // 安装版：使用 ask 提供三个选项
-        // ask 返回 true 表示点击 okLabel，false 表示点击 cancelLabel
-        const shouldUpdate = await ask(
-          `发现新版本 ${update.version}\n\n更新内容：\n${update.body ?? "无"}`,
-          {
-            title: "SwiftShare 更新",
-            kind: "info",
-            okLabel: "更新",
-            cancelLabel: "关闭",
-          },
-        );
-
-        if (shouldUpdate) {
-          // 用户选择自动更新
-          // 询问是否在更新失败时手动下载
-          try {
-            await update.downloadAndInstall();
-            await relaunch();
-          } catch (installError) {
-            const manualDownload = await confirm(
-              `自动更新失败：${installError}\n\n是否前往 GitHub 手动下载？`,
-              {
-                title: "更新失败",
-                okLabel: "前往下载",
-                cancelLabel: "取消",
-              },
-            );
-            if (manualDownload) {
-              await open(RELEASES_URL);
-            }
-          }
-        }
-        // 用户点击"关闭"或叉号：直接关闭，不跳转
+    if (!updateInfo) {
+      if (userInitiated) {
+        await ask("无法获取更新信息，请检查网络连接或镜像地址是否正确。", {
+          title: "SwiftShare 更新",
+          kind: "error",
+          okLabel: "好的",
+          cancelLabel: "关闭",
+        });
       }
-    } else if (userInitiated) {
-      await ask("当前已是最新版本。", {
-        title: "SwiftShare 更新",
-        kind: "info",
-        okLabel: "好的",
-        cancelLabel: "关闭",
-      });
+      return;
     }
+
+    // 检查是否有新版本
+    if (!isNewerVersion(updateInfo.version, currentVersion)) {
+      if (userInitiated) {
+        await ask(`当前已是最新版本 (${currentVersion})。`, {
+          title: "SwiftShare 更新",
+          kind: "info",
+          okLabel: "好的",
+          cancelLabel: "关闭",
+        });
+      }
+      return;
+    }
+
+    // 有新版本可用
+    console.log(`[Updater] New version available: ${updateInfo.version}`);
+    const downloadUrl = buildDownloadPageUrl(mirrorUrl);
+
+    // 显示更新提示（便携版和安装版统一处理）
+    const message = `发现新版本 ${updateInfo.version}\n\n更新内容：\n${updateInfo.body ?? "无"}`;
+
+    const yes = await confirm(message, {
+      title: "SwiftShare 更新",
+      okLabel: "前往下载",
+      cancelLabel: "稍后",
+    });
+
+    if (yes) {
+      await open(downloadUrl);
+    }
+    // 用户点击"稍后"或叉号：直接关闭，不跳转
   } catch (e) {
     // 通知检测完成（即使出错）
     options?.onChecking?.(false);
-    
+
+    console.error("[Updater] Update check failed:", e);
+
     if (userInitiated) {
       await ask(`检查更新失败：${e}`, {
         title: "SwiftShare 更新",
@@ -125,8 +170,6 @@ export async function checkForAppUpdates(
         okLabel: "好的",
         cancelLabel: "关闭",
       });
-    } else {
-      console.error("Auto update check failed:", e);
     }
   }
 }
