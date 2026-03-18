@@ -16,7 +16,13 @@
     "process:allow-restart",
     "shell:allow-open",
     "dialog:allow-ask",
-    "http:default",
+    {
+      "identifier": "http:default",
+      "allow": [
+        { "url": "https://**" },
+        { "url": "http://**" }
+      ]
+    },
     "http:allow-fetch",
     "core:app:allow-version"
   ]
